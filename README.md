@@ -454,7 +454,7 @@ self.predict = self.model.predict(
 
 ## 📝 開發者資訊 (Developer Info)
 
-**作者 (Author)**: AkinoAlice@TyrantRey
+
 
 **開發環境:**
 
