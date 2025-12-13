@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": ".venv"
+		},
+		{
+			"path": "helper"
+		},
+		{
+			"path": "model"
+		},
+		{
+			"path": "video"
+		},
+		{
+			"path": "result"
+		}
+	]
+}
