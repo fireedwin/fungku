@@ -3,8 +3,10 @@ import sys
 import logging
 import numpy as np
 import random
+import time
 from pathlib import Path
 from typing import Callable
+from collections import deque
 
 # PyQt5 Imports
 from PyQt5.QtWidgets import (
@@ -66,16 +68,19 @@ class MainPage(QWidget):
         btn_layout.setSpacing(30)
         btn_layout.addStretch()
 
+        # Added "自由練習" (Free Practice) as mode 4
         buttons_data = [
             ("記錄模式", 1),
             ("測試模式", 2),
-            ("指導模式", 3)
+            ("指導模式", 3),
+            ("自由練習", 4)
         ]
 
         for name, page_idx in buttons_data:
             btn = QPushButton(name)
             btn.setObjectName("MenuCardButton")
-            btn.setFixedSize(320, 180)
+            # Adjusted width to 220 to fit 4 buttons comfortably
+            btn.setFixedSize(220, 180)
             btn.clicked.connect(lambda checked, idx=page_idx: self.switch_page(idx))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_layout.addWidget(btn)
@@ -872,6 +877,301 @@ class GuidingPage(QWidget):
         self.back_callback()
 
 
+class RecognitionPage(QWidget):
+    def __init__(self, app_state: AppState, back_callback: Callable) -> None:
+        super().__init__()
+        self.app_state = app_state
+        self.back_callback = back_callback
+        self.posture_detector = pose_model
+        self.sqlite3_database = sqlite3_database
+        
+        self.setAutoFillBackground(True)
+
+        # Logic Variables
+        self.is_running = False
+        self.camera_cap = None
+        self.detection_timer = QTimer()
+        self.detection_timer.timeout.connect(self._process_frame)
+        
+        # Recognition Settings
+        # CHANGED: Increased buffer to 90 frames (approx 3 seconds) for longer moves
+        self.frame_buffer = deque(maxlen=90)  
+        self.loaded_templates = {} 
+        self.action_counts = {}
+        self.cooldown_counter = 0 
+        self.check_interval = 0    
+
+        # --- UI Components ---
+        self.camera_widget = VideoWidget()
+
+        # Right Panel for Stats
+        self.stats_label = QLabel("等待開始...")
+        self.stats_label.setStyleSheet("font-size: 18px; color: #FFFFFF; line-height: 150%;")
+        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        
+        # Status Label
+        self.current_action_label = QLabel("當前動作: 無")
+        self.current_action_label.setStyleSheet(
+            "font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;"
+        )
+        self.current_action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Debug Label (New)
+        self.debug_label = QLabel("Debug Info: Waiting...")
+        self.debug_label.setStyleSheet("font-size: 14px; color: #FFA500;")
+        self.debug_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Buttons
+        btn_start = QPushButton("開始偵測")
+        btn_start.clicked.connect(self._start_recognition)
+        btn_start.setFixedHeight(40)
+
+        btn_stop = QPushButton("停止")
+        btn_stop.clicked.connect(self._stop_recognition)
+        btn_stop.setFixedHeight(40)
+
+        btn_back = QPushButton("返回")
+        btn_back.clicked.connect(self._on_back)
+        btn_back.setFixedHeight(40)
+
+        # --- Layouts ---
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 60, 10)
+        
+        title_label = QLabel("自由練習模式")
+        title_label.setProperty("class", "h2")
+        title_label.setStyleSheet("padding-bottom: 0px;")
+
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        header_layout.addWidget(btn_start)
+        header_layout.addWidget(btn_stop)
+        header_layout.addWidget(btn_back)
+
+        content_layout = QHBoxLayout()
+        
+        # Left: Camera
+        camera_layout = QVBoxLayout()
+        camera_layout.addWidget(QLabel("即時影像"))
+        camera_layout.addWidget(self.camera_widget, 3)
+        
+        # Right: Stats
+        stats_layout = QVBoxLayout()
+        stats_layout.addWidget(self.current_action_label)
+        stats_layout.addWidget(self.debug_label) # Added Debug Label
+        stats_layout.addSpacing(20)
+        stats_layout.addWidget(QLabel("--- 練習統計 ---"))
+        stats_layout.addWidget(self.stats_label, 1) 
+        
+        content_layout.addLayout(camera_layout, 2)
+        content_layout.addLayout(stats_layout, 1)
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(header_layout)
+        main_layout.addLayout(content_layout)
+        
+        self.setLayout(main_layout)
+
+    def showEvent(self, a0):
+        self.action_counts = {}
+        self._update_stats_display()
+        self._load_templates()
+        super().showEvent(a0)
+
+    def _load_templates(self):
+        """Pre-load all recorded postures from DB"""
+        self.loaded_templates = {}
+        postures = self.sqlite3_database.fetch_all_postures()
+        
+        print(f"Loading templates...") 
+        for p in postures:
+            npy_path = p["npy_path"]
+            name = p["posture_name"]
+            if Path(npy_path).exists():
+                poses = np.load(npy_path)
+                if len(poses) > 0:
+                    # Normalize exactly like the live input
+                    normalized_seq = [self._normalize_keypoints(pose).flatten() for pose in poses]
+                    self.loaded_templates[name] = normalized_seq
+                    self.action_counts[name] = 0
+                    print(f"Loaded {name}: {len(normalized_seq)} frames")
+        
+        self._update_stats_display()
+
+    def _normalize_keypoints(self, kpts: np.ndarray) -> np.ndarray:
+        """Standard normalization (Center + Scale)"""
+        kpts = np.array(kpts, dtype=np.float32)
+        if kpts.ndim == 3: kpts = kpts[:, :2]
+        elif kpts.shape[-1] == 3: kpts = kpts[:, :2]
+        
+        center = np.mean(kpts, axis=0)
+        scale = np.linalg.norm(kpts - center) + 1e-6 
+        return (kpts - center) / scale
+
+    def _start_recognition(self):
+        if not self.loaded_templates:
+            QMessageBox.warning(self, "Warning", "資料庫中沒有動作資料，請先去「記錄模式」錄製動作！")
+            return
+
+        if self.camera_cap is None or not self.camera_cap.isOpened():
+            self.camera_cap = cv2.VideoCapture(0)
+            if not self.camera_cap.isOpened():
+                QMessageBox.critical(self, "Error", "無法打開攝影機!")
+                return
+
+        self.is_running = True
+        self.frame_buffer.clear()
+        self.cooldown_counter = 0
+        self.detection_timer.start(30) # 33 FPS
+
+    def _stop_recognition(self):
+        self.is_running = False
+        self.detection_timer.stop()
+        if self.camera_cap:
+            self.camera_cap.release()
+            self.camera_cap = None
+        self.camera_widget.stop()
+        self.current_action_label.setText("當前動作: 停止")
+
+    def _process_frame(self):
+        if not self.is_running or not self.camera_cap:
+            return
+
+        ret, frame = self.camera_cap.read()
+        if not ret: return
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # 1. Detect Pose
+        results = self.posture_detector.model.predict(frame_rgb, verbose=False)
+        
+        display_frame = frame_rgb.copy()
+        
+        # FIXED LOGIC: Checks if keypoints exist AND if at least one person found
+        if results and results[0].keypoints is not None and results[0].keypoints.xy.shape[0] > 0:
+            kpts_xy = results[0].keypoints.xy[0].cpu().numpy()
+            display_frame = self._draw_skeleton(display_frame, kpts_xy)
+            
+            # Extract for recognition
+            current_pose_norm = self._normalize_keypoints(kpts_xy).flatten()
+            self.frame_buffer.append(current_pose_norm)
+        else:
+            # If person lost, clear buffer partially
+            if len(self.frame_buffer) > 0:
+                self.frame_buffer.popleft()
+
+        self._update_camera_widget(display_frame)
+
+        # 2. Recognition Logic
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+            # Visual feedback for cooldown
+            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
+        else:
+            self.check_interval += 1
+            # Check every 5 frames to save CPU
+            if len(self.frame_buffer) >= 15 and self.check_interval % 5 == 0: 
+                self._recognize_action()
+
+    def _recognize_action(self):
+        best_score = 0
+        best_name = None
+        
+        live_seq = list(self.frame_buffer)
+        
+        # Debug string to print to console
+        debug_str = f"Buff:{len(live_seq)} | "
+
+        for name, template_seq in self.loaded_templates.items():
+            # Optimization 1: Skip if template is too short
+            if len(template_seq) < 10: continue
+
+            # Optimization 2: "Length Sanity Check"
+            # If the user's buffer is less than half the length of the recorded move,
+            # don't try to compare yet. It's too early.
+            if len(live_seq) < len(template_seq) * 0.3: 
+                continue
+
+            try:
+                # FastDTW
+                distance, _ = fastdtw(live_seq, template_seq, dist=euclidean)
+                
+                # Normalize distance
+                max_len = max(len(live_seq), len(template_seq))
+                avg_dist = distance / max_len
+                
+                # --- MATHEMATICAL ADJUSTMENT HERE ---
+                # Changed -5 (Strict) to -2 (Forgiving)
+                # This turns a "15%" score into a "45-50%" score
+                similarity = np.exp(-2 * avg_dist) * 100
+                
+                debug_str += f"{name}:{similarity:.0f}% | "
+
+                if similarity > best_score:
+                    best_score = similarity
+                    best_name = name
+            except Exception as e:
+                continue
+
+        # Print debug info to terminal
+        print(debug_str)
+        
+        # Show best GUESS on UI
+        if best_name:
+             self.debug_label.setText(f"Best: {best_name} ({best_score:.1f}%)")
+
+        # --- THRESHOLD ADJUSTMENT HERE ---
+        # Lowered from 70 to 50
+        if best_score > 50 and best_name:
+            self.action_counts[best_name] += 1
+            self.current_action_label.setText(f"偵測到: {best_name}")
+            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
+            
+            # Cooldown: 45 frames (~1.5 seconds) to prevent double counting
+            self.cooldown_counter = 45 
+            self.frame_buffer.clear()
+            
+            self._update_stats_display()
+        else:
+            self.current_action_label.setText("偵測中...")
+            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;")
+
+    def _update_stats_display(self):
+        text = ""
+        for name, count in self.action_counts.items():
+            color = "#FFFFFF" if count == 0 else "#4CAF50"
+            text += f"<div style='margin-bottom:5px;'><span style='color:{color}; font-weight:bold;'>{name}:</span> {count} 次</div>"
+        self.stats_label.setText(text)
+
+    def _update_camera_widget(self, img):
+        h, w, ch = img.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        scaled = qt_image.scaled(
+            self.camera_widget.label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.camera_widget.label.setPixmap(QPixmap.fromImage(scaled))
+
+    def _draw_skeleton(self, image, keypoints):
+        skeleton_connections = [
+            (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+            (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+        ]
+        for connection in skeleton_connections:
+            start_idx, end_idx = connection
+            if start_idx < len(keypoints) and end_idx < len(keypoints):
+                start_point = tuple(keypoints[start_idx].astype(int))
+                end_point = tuple(keypoints[end_idx].astype(int))
+                if start_point[0] > 0 and start_point[1] > 0 and end_point[0] > 0 and end_point[1] > 0:
+                    cv2.line(image, start_point, end_point, (0, 255, 0), 2)
+        return image
+
+    def _on_back(self):
+        self._stop_recognition()
+        self.back_callback()
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -894,6 +1194,11 @@ class MainWindow(QMainWindow):
             TestingPage(self.app_state, lambda: self.stack.setCurrentIndex(0))
         )
         self.stack.addWidget(GuidingPage(lambda: self.stack.setCurrentIndex(0)))
+        
+        # New Page Added
+        self.stack.addWidget(
+            RecognitionPage(self.app_state, lambda: self.stack.setCurrentIndex(0))
+        )
         
         self.setCentralWidget(self.stack)
 
