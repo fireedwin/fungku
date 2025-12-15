@@ -33,6 +33,14 @@ An AI-powered kung fu/martial arts training application using YOLO models for po
 - 自動進度追蹤，完成時顯示恭喜訊息
 - 記錄完成次數
 
+### 🆓 自由練習模式 (Free Practice Mode)
+
+- **全自動動作識別**: 系統自動分析您的動作並與資料庫中的所有姿態進行比對，無需手動選擇目標。
+- **智慧計數與評分**: 動作相似度達標後自動計數，並具備分數加成機制 (Gamification) 提升練習樂趣。
+- **動態難度調整**: 提供「簡單、普通、困難」三種難度分級，適應不同階段的練習者。
+- **誤判防禦機制**: 內建「移動門檻 (Movement Gate)」與「起始點檢查」，防止發呆或無效動作被誤計。
+- **自動鏡像偵測**: 支援 Auto-Mirror 邏輯，無論面對鏡頭的方向為何，皆能準確識別。
+
 ## 🛠️ 技術架構 (Tech Stack)
 
 - **前端框架**: PyQt6 - 現代化的 GUI 介面
@@ -201,6 +209,21 @@ KungFu/
 - 當前影格進度顯示
 - 完成次數記錄
 
+### 🤸 自由練習模式 (Free Practice Mode)
+
+1. 在主選單點擊「**自由練習**」按鈕
+2. 選擇練習難度:
+   - **簡單 (Easy)**: 通過門檻 30%，適合初學者熟悉動作
+   - **普通 (Normal)**: 通過門檻 50%，適合日常練習 (預設)
+   - **困難 (Hard)**: 通過門檻 80%，適合追求完美的武者
+3. 點擊「**開始偵測**」啟動攝影機
+4. 在鏡頭前做出資料庫中已錄製的任何動作（如：金手、水手等）
+5. 系統會即時分析：
+   - **狀態顯示**: 顯示當前是「靜止」還是「偵測中」
+   - **識別成功**: 顯示動作名稱與相似度分數，並自動累積次數
+6. 完成動作後會有冷卻時間 (Cooldown)，防止重複計數
+7. 點擊「**停止**」結束練習並查看統計結果
+
 ## 🔬 核心演算法 (Core Algorithms)
 
 ### 姿態正規化 (Keypoint Normalization)
@@ -260,6 +283,42 @@ def compute_similarity(seq_a, seq_b):
 
     return similarity, avg_distance, distance, path
 ```
+
+### 智慧識別邏輯 (Smart Recognition Logic)
+
+自由練習模式採用了進階的混合演算法以確保準確度：
+
+1. **移動門檻 (Movement Gate)**: 計算時間窗口內的總位移量，若使用者處於靜止狀態，自動略過計算以節省資源並防止誤判。
+   # 在 _recognize_action 裡面
+   avg_speed = self._calculate_motion(self.frame_buffer)
+
+   if avg_speed < 0.015:
+      self.debug_label.setText(f"狀態: 靜止 (Motion: {avg_speed:.3f})")
+      return  # <--- 這裡就是門檻，不動就直接擋掉
+2. **軀幹比例正規化 (Torso-Scale Normalization)**: 使用頸部到臀部的距離作為基準單位，解決了使用者距離鏡頭遠近造成的尺度差異，同時保留了前後拳的深度資訊（Depth Cues）。
+   # 在 _compute_spatial_features 裡面
+   torso_size = np.linalg.norm(shoulder_mid - hip_mid)
+
+   # ... (略)
+
+   norm_vec = vec / torso_size  # <--- 這裡就是正規化，把長度變成相對比例
+   features.extend(norm_vec)
+
+3. **自動鏡像匹配 (Auto-Mirroring)**: 系統同時計算原始骨架與水平翻轉骨架的 DTW 距離，取最佳值作為最終分數，解決了網路攝影機鏡像翻轉的問題。
+   # 在 _recognize_action 裡面
+   # 1. 創造翻轉版數據
+   for feat in live_seq_normal:
+      feat_flipped = feat.copy()
+      feat_flipped[0::2] = -feat_flipped[0::2] # 把 X 軸數值變負號 (翻轉)
+      live_seq_flipped.append(feat_flipped)
+
+   # ... (略)
+
+   # 2. 兩個都比對，取最小值 (min_dist)
+   dist_norm, _ = fastdtw(live_seq_normal, template_seq, dist=euclidean)
+   dist_flip, _ = fastdtw(live_seq_flipped, template_seq, dist=euclidean)
+
+   min_dist = min(dist_norm, dist_flip) # <--- 自動選比較像的那邊
 
 **演算法特點:**
 
