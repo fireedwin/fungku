@@ -42,9 +42,51 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 logging.basicConfig(filename="log.log", filemode="w+", level=logging.DEBUG)
 
 
+def get_working_cameras(max_check=3):
+    """
+    Scans indices 0 to max_check.
+    Tries BOTH DirectShow and Default backends.
+    Only returns cameras that successfully read a frame.
+    Returns list of tuples: [(index, backend_enum, "Name")]
+    """
+    working_cams = []
+    
+    print("Scanning for cameras...")
+    for i in range(max_check):
+        # 1. Try DirectShow (Best for OBS / Virtual Cams)
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                print(f"  - Camera {i}: OK (DirectShow)")
+                working_cams.append((i, cv2.CAP_DSHOW, f"Camera {i} (DSHOW)"))
+                cap.release()
+                continue 
+        cap.release()
+
+        # 2. Try Default/MSMF (Best for built-in Laptop Cams)
+        cap = cv2.VideoCapture(i, cv2.CAP_ANY)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                print(f"  - Camera {i}: OK (Default)")
+                working_cams.append((i, cv2.CAP_ANY, f"Camera {i} (Default)"))
+                cap.release()
+                continue
+        cap.release()
+    
+    if not working_cams:
+        print("  - No cameras responded. Defaulting to Camera 0.")
+        working_cams.append((0, cv2.CAP_ANY, "Camera 0 (Fallback)"))
+        
+    return working_cams
+
+
 class AppState:
     def __init__(self) -> None:
         self.recorded_videos: list[str] = []
+        # Store (index, backend) tuple
+        self.camera_config = (0, cv2.CAP_ANY)
 
 
 class MainPage(QWidget):
@@ -118,12 +160,19 @@ class VideoWidget(QWidget):
         self.timer.start(30)
         return True
 
-    def load_camera(self):
+    def load_camera(self, camera_id=0, backend=cv2.CAP_ANY):
         self.stop()
-        self.cap = cv2.VideoCapture(0)
+        self.cap = cv2.VideoCapture(camera_id, backend)
+        
         if not self.cap.isOpened():
-            self.label.setText("Camera not available")
+            self.label.setText(f"Camera {camera_id} error")
             return False
+            
+        ret, _ = self.cap.read()
+        if not ret:
+            self.label.setText(f"Camera {camera_id} not sending data")
+            return False
+            
         self.timer.start(30)
         return True
 
@@ -235,13 +284,29 @@ class RecordingPage(QWidget):
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
+            # 1. 執行偵測
             predicted_video_path, predicted_npy_path = (
                 self.posture_detector.detect_video(self.path)
             )
             self.posture_detector.save_npy(predicted_npy_path)
             
+            # 2. 準備名稱 (處理重複問題)
+            base_name = Path(self.path).stem
+            final_name = base_name
+            
+            # 檢查資料庫是否已有同名 (避免撞名導致無法寫入)
+            existing_postures = self.sqlite3_database.fetch_all_postures()
+            existing_names = [p["posture_name"] for p in existing_postures]
+            
+            if base_name in existing_names:
+                # 如果名字重複，加上時間戳記
+                timestamp = int(time.time()) % 10000
+                final_name = f"{base_name}_{timestamp}"
+                print(f"Name collision detected. Renamed to: {final_name}")
+
+            # 3. 寫入資料庫
             self.sqlite3_database.insert_posture(
-                posture_name=Path(self.path).stem,
+                posture_name=final_name,
                 video_path=str(predicted_video_path),
                 npy_path=str(predicted_npy_path),
             )
@@ -253,11 +318,11 @@ class RecordingPage(QWidget):
                     f"未找到視頻: {predicted_video_path}"
                 )
 
-            QMessageBox.information(
-                self,
-                "完成",
-                f"動作捕捉完成!\n結果已儲存至:\n{predicted_video_path}",
-            )
+            msg = f"動作捕捉完成!\n已儲存為: {final_name}"
+            if final_name != base_name:
+                msg += "\n(原名稱已存在，已自動重新命名)"
+
+            QMessageBox.information(self, "完成", msg)
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"偵測失敗:\n{str(e)}")
@@ -369,13 +434,21 @@ class TestingPage(QWidget):
         self.setLayout(main_layout)
 
     def showEvent(self, a0):
+        # FIX: Check if files actually exist before adding to dropdown
         self.combo_recorded.clear()
         postures = self.sqlite3_database.fetch_all_postures()
+        added_names = set()
         for posture in postures:
-            self.combo_recorded.addItem(
-                posture["posture_name"],
-                {"video_path": posture["video_path"], "npy_path": posture["npy_path"]},
-            )
+            vid_path = posture["video_path"]
+            npy_path = posture["npy_path"]
+            name = posture["posture_name"]
+            
+            if Path(vid_path).exists() and Path(npy_path).exists():
+                self.combo_recorded.addItem(
+                    name,
+                    {"video_path": vid_path, "npy_path": npy_path},
+                )
+                added_names.add(name)
         super().showEvent(a0)
 
     def _load_student(self) -> None:
@@ -519,7 +592,7 @@ class GuidingPage(QWidget):
         self.finished_times = 0
         self.is_running = False
         self.camera_cap = None
-        self.selected_camera_id: int = 0
+        self.current_camera_id = 0
 
         # --- Controls ---
         self.combo_videos = QComboBox()
@@ -527,6 +600,14 @@ class GuidingPage(QWidget):
         self.combo_videos.setFixedWidth(200)
         self.combo_videos.setFixedHeight(40)
         self.combo_videos.setPlaceholderText("Select Posture")
+
+        # Camera Selector
+        self.combo_camera = QComboBox()
+        self.combo_camera.setPlaceholderText("選擇攝影機")
+        self.combo_camera.setFixedWidth(150)
+        self.combo_camera.setFixedHeight(40)
+        self._populate_cameras()
+        self.combo_camera.currentIndexChanged.connect(self._on_camera_changed)
 
         btn_load = QPushButton("載入")
         btn_load.clicked.connect(self._load_teacher_video)
@@ -575,6 +656,8 @@ class GuidingPage(QWidget):
 
         header_layout.addWidget(title_label)
         header_layout.addStretch()
+        header_layout.addWidget(QLabel("攝影機:"))
+        header_layout.addWidget(self.combo_camera)
         header_layout.addWidget(self.combo_videos)
         header_layout.addWidget(btn_load)
         header_layout.addWidget(btn_start)
@@ -614,14 +697,35 @@ class GuidingPage(QWidget):
         self.detection_timer = QTimer()
         self.detection_timer.timeout.connect(self._process_frame)
 
+    def _populate_cameras(self):
+        cams = get_working_cameras()
+        self.combo_camera.clear()
+        for idx, backend, name in cams:
+            self.combo_camera.addItem(name, (idx, backend))
+        
+        if cams:
+            self.current_camera_id = cams[0][0]
+
+    def _on_camera_changed(self, index):
+        data = self.combo_camera.currentData()
+        if data is not None:
+            self.current_camera_id, _ = data
+            if self.is_running:
+                self._stop_practice()
+                self._start_practice()
+
     def showEvent(self, a0):
+        # FIX: Filter non-existent files
         self.combo_videos.clear()
         postures = self.sqlite3_database.fetch_all_postures()
+        added_names = set()
         for posture in postures:
-            self.combo_videos.addItem(
-                posture["posture_name"],
-                {"video_path": posture["video_path"], "npy_path": posture["npy_path"]},
-            )
+            if Path(posture["video_path"]).exists() and Path(posture["npy_path"]).exists():
+                self.combo_videos.addItem(
+                    posture["posture_name"],
+                    {"video_path": posture["video_path"], "npy_path": posture["npy_path"]},
+                )
+                added_names.add(posture["posture_name"])
         super().showEvent(a0)
 
     def _on_video_selected(self, index: int):
@@ -714,9 +818,17 @@ class GuidingPage(QWidget):
         self._display_current_frame()
 
         if self.camera_cap is None or not self.camera_cap.isOpened():
-            self.camera_cap = cv2.VideoCapture(0)
+            # Use found backend
+            self.camera_cap = cv2.VideoCapture(self.current_camera_id, cv2.CAP_DSHOW) # Fallback to DSHOW if id is raw index
+            # But wait, combo gives (idx, backend). Let's fetch properly
+            idx_backend = self.combo_camera.currentData()
+            if idx_backend:
+                self.camera_cap = cv2.VideoCapture(idx_backend[0], idx_backend[1])
+            else:
+                self.camera_cap = cv2.VideoCapture(self.current_camera_id, cv2.CAP_DSHOW)
+
             if not self.camera_cap.isOpened():
-                QMessageBox.critical(self, "Error", "無法打開攝影機!")
+                QMessageBox.critical(self, "Error", f"無法打開攝影機 {self.current_camera_id}!")
                 return
 
         self.is_running = True
@@ -866,7 +978,6 @@ class GuidingPage(QWidget):
         self._stop_practice()
         self.back_callback()
 
-
 class RecognitionPage(QWidget):
     def __init__(self, app_state: AppState, back_callback: Callable) -> None:
         super().__init__()
@@ -883,43 +994,45 @@ class RecognitionPage(QWidget):
         self.detection_timer = QTimer()
         self.detection_timer.timeout.connect(self._process_frame)
         
-        # Recognition Settings
-        self.frame_buffer = deque(maxlen=90)  
+        # State Machine
+        self.state = "IDLE" 
+        self.recording_buffer = [] 
         self.loaded_templates = {} 
         self.action_counts = {}
-        self.cooldown_counter = 0 
-        self.check_interval = 0    
         
-        # Difficulty Setting (Default: Normal = 50%)
-        self.passing_threshold = 50 
-
-        # --- UI Components ---
-        self.camera_widget = VideoWidget()
-
-        # Right Panel for Stats
-        self.stats_label = QLabel("等待開始...")
-        self.stats_label.setStyleSheet("font-size: 18px; color: #FFFFFF; line-height: 150%;")
-        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        
-        # Status Label
-        self.current_action_label = QLabel("當前動作: 無")
-        self.current_action_label.setStyleSheet(
-            "font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;"
-        )
-        self.current_action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # Debug Label
-        self.debug_label = QLabel("Debug Info: Waiting...")
-        self.debug_label.setStyleSheet("font-size: 14px; color: #FFA500;")
-        self.debug_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # --- Settings ---
+        self.motion_start_threshold = 0.4  
+        self.target_recording_frames = 12
+        self.passing_threshold = 50        
+        self.cooldown_counter = 0          
 
         # Controls
+        self.combo_camera = QComboBox()
+        self.combo_camera.setPlaceholderText("選擇攝影機")
+        self.combo_camera.setFixedWidth(150)
+        self.combo_camera.setFixedHeight(40)
+        self._populate_cameras()
+        self.combo_camera.currentIndexChanged.connect(self._on_camera_changed)
+
         self.combo_difficulty = QComboBox()
         self.combo_difficulty.addItems(["簡單 (Easy)", "普通 (Normal)", "困難 (Hard)"])
-        self.combo_difficulty.setCurrentIndex(1) # Default to Normal
+        self.combo_difficulty.setCurrentIndex(1)
         self.combo_difficulty.currentIndexChanged.connect(self._on_difficulty_changed)
         self.combo_difficulty.setFixedWidth(150)
         self.combo_difficulty.setFixedHeight(40)
+
+        # Buttons
+        btn_reload = QPushButton("🔄 重整")
+        btn_reload.clicked.connect(self._reload_database)
+        btn_reload.setFixedWidth(80)
+        btn_reload.setFixedHeight(40)
+        btn_reload.setStyleSheet("background-color: #607D8B; border: none;")
+
+        btn_clean = QPushButton("🧹 清理")
+        btn_clean.clicked.connect(self._clean_invalid_records)
+        btn_clean.setFixedWidth(80)
+        btn_clean.setFixedHeight(40)
+        btn_clean.setStyleSheet("background-color: #795548; border: none;")
 
         btn_start = QPushButton("開始偵測")
         btn_start.clicked.connect(self._start_recognition)
@@ -933,30 +1046,49 @@ class RecognitionPage(QWidget):
         btn_back.clicked.connect(self._on_back)
         btn_back.setFixedHeight(40)
 
-        # --- Layouts ---
+        # Components
+        self.camera_widget = VideoWidget()
+
+        self.stats_label = QLabel("等待開始...")
+        self.stats_label.setStyleSheet("font-size: 18px; color: #FFFFFF; line-height: 150%;")
+        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        
+        self.current_action_label = QLabel("請開始動作")
+        self.current_action_label.setStyleSheet(
+            "font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;"
+        )
+        self.current_action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.debug_label = QLabel("State: IDLE")
+        self.debug_label.setStyleSheet("font-size: 14px; color: #FFA500;")
+        self.debug_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.debug_label.setWordWrap(True)
+
+        # Layouts
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 60, 10)
         
-        title_label = QLabel("自由練習模式")
+        title_label = QLabel("自由練習")
         title_label.setProperty("class", "h2")
         title_label.setStyleSheet("padding-bottom: 0px;")
 
         header_layout.addWidget(title_label)
         header_layout.addStretch()
+        header_layout.addWidget(QLabel("攝影機:"))
+        header_layout.addWidget(self.combo_camera)
         header_layout.addWidget(QLabel("難度:"))
         header_layout.addWidget(self.combo_difficulty)
+        header_layout.addWidget(btn_reload)
+        header_layout.addWidget(btn_clean)
         header_layout.addWidget(btn_start)
         header_layout.addWidget(btn_stop)
         header_layout.addWidget(btn_back)
 
         content_layout = QHBoxLayout()
-        
-        # Left: Camera
         camera_layout = QVBoxLayout()
         camera_layout.addWidget(QLabel("即時影像"))
         camera_layout.addWidget(self.camera_widget, 3)
         
-        # Right: Stats
         stats_layout = QVBoxLayout()
         stats_layout.addWidget(self.current_action_label)
         stats_layout.addWidget(self.debug_label)
@@ -970,230 +1102,234 @@ class RecognitionPage(QWidget):
         main_layout = QVBoxLayout()
         main_layout.addLayout(header_layout)
         main_layout.addLayout(content_layout)
-        
         self.setLayout(main_layout)
 
-    def showEvent(self, a0):
-        self.action_counts = {}
-        self._update_stats_display()
-        self._load_templates()
-        super().showEvent(a0)
-
-    def _on_difficulty_changed(self, index):
-        if index == 0:   # Easy
-            self.passing_threshold = 30
-        elif index == 1: # Normal
-            self.passing_threshold = 50
-        elif index == 2: # Hard
-            self.passing_threshold = 80
-        print(f"Difficulty changed. Threshold: {self.passing_threshold}%")
-
-    # --- PART 1: ROBUST SPATIAL FEATURES ---
-    def _compute_spatial_features(self, kpts: np.ndarray) -> np.ndarray:
-        """
-        Calculates Vectors Normalized by Torso Scale.
-        Only Shape (Position), No Velocity.
-        """
-        if kpts.shape != (17, 2):
-            return np.zeros(16) 
-
-        # Calculate Torso Scale (Neck to Hip)
-        shoulder_mid = (kpts[5] + kpts[6]) / 2
-        hip_mid = (kpts[11] + kpts[12]) / 2
-        torso_size = np.linalg.norm(shoulder_mid - hip_mid)
+    # --- 1. CORE MATH ---
+    def _normalize_keypoints(self, kpts: np.ndarray) -> np.ndarray:
+        """ Torso-Anchored Normalization """
+        kpts = np.array(kpts, dtype=np.float32)
+        if kpts.ndim == 3: kpts = kpts[:, :2]
+        elif kpts.shape[-1] == 3: kpts = kpts[:, :2]
         
+        hip_center = (kpts[11] + kpts[12]) / 2.0
+        centered = kpts - hip_center
+        
+        shoulder_center = (kpts[5] + kpts[6]) / 2.0
+        torso_size = np.linalg.norm(shoulder_center - hip_center)
         if torso_size < 1.0: torso_size = 1.0
+        
+        return centered / torso_size
 
-        connections = [
-            (5, 7), (7, 9),   # Left Arm
-            (6, 8), (8, 10),  # Right Arm
-            (11, 13), (13, 15), # Left Leg
-            (12, 14), (14, 16)  # Right Leg
-        ]
+    def _extract_features(self, sequence):
+        """
+        Advanced Feature Extraction for Wuxing Fists.
+        Returns Shape: (Frames, 36) -> 34 Pos coords + 2 Special Features
+        """
+        seq_array = np.array(sequence) # (Frames, 17, 2)
+        
+        # --- A. Weighted Positions (34 dims) ---
+        positions = seq_array.reshape(seq_array.shape[0], -1)
+        weights = np.ones((17, 2), dtype=np.float32)
+        weights[7:11, :] = 3.0 # Boost Wrists/Elbows
+        weights[5:7, :] = 1.5  # Boost Shoulders
+        weighted_positions = positions * weights.flatten()
+        
+        # --- B. Special Features (Geometric) ---
+        
+        # 1. Hand Span (木手特徵): Distance between wrists
+        # L_Wrist=9, R_Wrist=10
+        l_wrist = seq_array[:, 9, :] 
+        r_wrist = seq_array[:, 10, :]
+        hand_span = np.linalg.norm(l_wrist - r_wrist, axis=1).reshape(-1, 1)
+        
+        # 2. Vertical Hand Diff (金手特徵): Abs Y-diff between wrists
+        # "Chopping" usually creates vertical separation
+        vertical_diff = np.abs(l_wrist[:, 1] - r_wrist[:, 1]).reshape(-1, 1)
+        
+        # 3. Arm Extension (火手特徵): Distance from Shoulder to Wrist
+        # This detects "Pushing out". We verify average extension of both arms.
+        # L_Shoulder=5, R_Shoulder=6
+        l_shoulder = seq_array[:, 5, :]
+        r_shoulder = seq_array[:, 6, :]
+        
+        l_ext = np.linalg.norm(l_wrist - l_shoulder, axis=1)
+        r_ext = np.linalg.norm(r_wrist - r_shoulder, axis=1)
+        # Average extension of both arms
+        arm_extension = ((l_ext + r_ext) / 2.0).reshape(-1, 1)
 
-        features = []
-        for start_idx, end_idx in connections:
-            vec = kpts[end_idx] - kpts[start_idx]
-            norm_vec = vec / torso_size 
-            features.extend(norm_vec) 
-            
-        return np.array(features)
+        # Apply heavy weights to these special features to force differentiation
+        hand_span = hand_span * 4.0        # For Wood
+        vertical_diff = vertical_diff * 4.0 # For Metal
+        arm_extension = arm_extension * 4.0 # For Fire
+        
+        # Combine all: [Pos(34), Span(1), VertDiff(1), Extension(1)] -> 37 dims
+        features = np.concatenate([
+            weighted_positions, 
+            hand_span, 
+            vertical_diff, 
+            arm_extension
+        ], axis=1)
+        
+        return features
 
-    # --- PART 2: LOAD TEMPLATES (PURE SHAPE) ---
+    # --- 2. LOAD TEMPLATES ---
     def _load_templates(self):
         self.loaded_templates = {}
         postures = self.sqlite3_database.fetch_all_postures()
         
-        print("Loading templates (Shape Only)...") 
+        print("\n=== LOADING TEMPLATES ===")
         for p in postures:
             npy_path = p["npy_path"]
             name = p["posture_name"]
-            if Path(npy_path).exists():
-                poses = np.load(npy_path)
-                if len(poses) > 0:
-                    feature_seq = []
-                    for pose in poses:
-                        if pose.ndim == 2 and pose.shape[1] == 3: xy = pose[:, :2]
-                        elif pose.ndim == 1: xy = pose.reshape(-1, 2)
-                        else: xy = pose
-
-                        curr_spatial = self._compute_spatial_features(xy)
-                        feature_seq.append(curr_spatial)
+            path_obj = Path(npy_path)
+            
+            if path_obj.exists():
+                try:
+                    poses = np.load(str(path_obj))
+                    if len(poses) > 10:
+                        norm_seq = [self._normalize_keypoints(pose) for pose in poses]
+                        feat_seq = self._extract_features(norm_seq)
                         
-                    self.loaded_templates[name] = feature_seq
-                    self.action_counts[name] = 0
-                    print(f"Loaded {name}: {len(feature_seq)} frames")
-        
+                        self.loaded_templates[name] = feat_seq
+                        self.action_counts[name] = 0
+                        print(f"  [OK] {name}: {len(feat_seq)} frames")
+                except Exception: pass
+            else:
+                print(f"  [MISSING] {name}")
         self._update_stats_display()
 
-    def _start_recognition(self):
-        if not self.loaded_templates:
-            QMessageBox.warning(self, "Warning", "資料庫中沒有動作資料，請先去「記錄模式」錄製動作！")
-            return
-
-        if self.camera_cap is None or not self.camera_cap.isOpened():
-            self.camera_cap = cv2.VideoCapture(0)
-            if not self.camera_cap.isOpened():
-                QMessageBox.critical(self, "Error", "無法打開攝影機!")
-                return
-
-        self.is_running = True
-        self.frame_buffer.clear()
-        self.cooldown_counter = 0
-        self.detection_timer.start(30) 
-
-    def _stop_recognition(self):
-        self.is_running = False
-        self.detection_timer.stop()
-        if self.camera_cap:
-            self.camera_cap.release()
-            self.camera_cap = None
-        self.camera_widget.stop()
-        self.current_action_label.setText("當前動作: 停止")
-
-    # --- PART 3: PROCESS FRAME ---
+    # --- 3. PROCESS FRAME ---
     def _process_frame(self):
-        if not self.is_running or not self.camera_cap:
-            return
+        if not self.is_running or not self.camera_cap: return
 
         ret, frame = self.camera_cap.read()
         if not ret: return
+
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self._update_camera_widget(frame_rgb)
+            return
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.posture_detector.model.predict(frame_rgb, verbose=False)
         display_frame = frame_rgb.copy()
         
+        current_kpts = None
         if results and results[0].keypoints is not None and results[0].keypoints.xy.shape[0] > 0:
-            kpts_xy = results[0].keypoints.xy[0].cpu().numpy()
-            display_frame = self._draw_skeleton(display_frame, kpts_xy)
-            
-            # Calculate Spatial Features
-            curr_spatial = self._compute_spatial_features(kpts_xy)
-            self.frame_buffer.append(curr_spatial)
-            
-        else:
-            if len(self.frame_buffer) > 0:
-                self.frame_buffer.popleft()
+            current_kpts = results[0].keypoints.xy[0].cpu().numpy()
+            display_frame = self._draw_skeleton(display_frame, current_kpts)
 
         self._update_camera_widget(display_frame)
 
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
-        else:
-            self.check_interval += 1
-            # Check every 5 frames
-            if len(self.frame_buffer) >= 15 and self.check_interval % 5 == 0: 
-                self._recognize_action()
+        if current_kpts is None: return
 
-    def _calculate_motion(self, buffer):
-        """Calculates total vector change in the buffer"""
+        # 1. Normalize
+        norm_pose = self._normalize_keypoints(current_kpts)
+        
+        # 2. Check Motion
+        flat_pose = norm_pose.flatten()
+        if not hasattr(self, 'motion_window'): self.motion_window = deque(maxlen=5)
+        self.motion_window.append(flat_pose)
+        motion_variance = self._calculate_variance(self.motion_window)
+        
+        # STATE MACHINE
+        if self.state == "IDLE":
+            self.debug_label.setText(f"Ready... (Var: {motion_variance:.2f})")
+            if motion_variance > self.motion_start_threshold:
+                self.state = "RECORDING"
+                self.recording_buffer = [] 
+                self.current_action_label.setText("🔴 錄製中...")
+                self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #FF5722; border: 2px solid #FF5722; border-radius: 10px; padding: 10px;")
+                print(">>> START RECORDING")
+
+        elif self.state == "RECORDING":
+            self.recording_buffer.append(norm_pose)
+            
+            frames_recorded = len(self.recording_buffer)
+            self.debug_label.setText(f"REC: {frames_recorded}/{self.target_recording_frames}")
+            
+            if frames_recorded >= self.target_recording_frames:
+                print(f">>> Full Buffer ({frames_recorded}). Evaluating...")
+                self._evaluate_sequence(self.recording_buffer)
+                self.cooldown_counter = 20 
+                self.state = "IDLE"
+
+    def _calculate_variance(self, buffer):
         if len(buffer) < 2: return 0.0
-        motion = 0.0
-        # Check every 3rd frame
-        for i in range(3, len(buffer), 3):
-            prev = buffer[i-3]
-            curr = buffer[i]
-            motion += np.linalg.norm(curr - prev)
-        return motion / len(buffer) # Average motion per frame
+        data = np.array(buffer)
+        return np.sum(np.std(data, axis=0))
 
-    def _recognize_action(self):
-        # IDEA 1: MOVEMENT GATE
-        # Avg speed per frame. 0.01 is very still. 0.05 is moving.
-        avg_speed = self._calculate_motion(self.frame_buffer)
+    def _evaluate_sequence(self, recorded_seq_raw):
+        # 1. Convert to Features
+        user_features = self._extract_features(recorded_seq_raw)
         
-        if avg_speed < 0.015:
-            self.debug_label.setText(f"狀態: 靜止 (Motion: {avg_speed:.3f})")
-            return
+        # 2. Flipped Version
+        recorded_seq_flipped = []
+        for pose in recorded_seq_raw:
+            flipped = pose.copy()
+            flipped[:, 0] = -flipped[:, 0] # Flip X
+            recorded_seq_flipped.append(flipped)
+        user_features_flipped = self._extract_features(recorded_seq_flipped)
 
-        best_score = 0
-        best_name = None
-        
-        live_seq_normal = list(self.frame_buffer)
-        
-        # --- AUTO-MIRROR LOGIC ---
-        live_seq_flipped = []
-        for feat in live_seq_normal:
-            feat_flipped = feat.copy()
-            feat_flipped[0::2] = -feat_flipped[0::2]
-            live_seq_flipped.append(feat_flipped)
+        scores = [] 
 
-        debug_str = f"Mot:{avg_speed:.2f} | "
-
-        for name, template_seq in self.loaded_templates.items():
-            if len(template_seq) < 10: continue
-
-            if len(live_seq_normal) < len(template_seq) * 0.3: 
-                continue
-
+        for name, template_features in self.loaded_templates.items():
+            if len(template_features) < 10: continue
+            
             try:
-                dist_norm, _ = fastdtw(live_seq_normal, template_seq, dist=euclidean)
-                dist_flip, _ = fastdtw(live_seq_flipped, template_seq, dist=euclidean)
-                
+                dist_norm, _ = fastdtw(user_features, template_features, dist=euclidean)
+                dist_flip, _ = fastdtw(user_features_flipped, template_features, dist=euclidean)
                 min_dist = min(dist_norm, dist_flip)
-                max_len = max(len(live_seq_normal), len(template_seq))
+                max_len = max(len(user_features), len(template_features))
                 avg_dist = min_dist / max_len
                 
-                # --- Relaxed Math (-1.5) ---
-                raw_similarity = np.exp(-1.5 * avg_dist) * 100
+                # Similarity
+                similarity = np.exp(-0.15 * avg_dist) * 100
+                scores.append((name, similarity))
                 
-                # --- GAMIFICATION BOOST ---
-                # If score > 10%, we boost it by +30% to encourage user
-                # e.g. 15% becomes 45%
-                if raw_similarity > 10:
-                    similarity = raw_similarity + 30
-                else:
-                    similarity = raw_similarity # Keep garbage low
-                
-                if similarity > 100: similarity = 100
+            except Exception: continue
 
-                if similarity > 30:
-                    tag = "(M)" if dist_flip < dist_norm else ""
-                    debug_str += f"{name}{tag}:{similarity:.0f}% | "
-
-                if similarity > best_score:
-                    best_score = similarity
-                    best_name = name
-            except Exception:
-                continue
-
-        print(debug_str)
+        scores.sort(key=lambda x: x[1], reverse=True)
         
-        if best_name:
-             self.debug_label.setText(f"Best: {best_name} ({best_score:.1f}%)")
+        top_3_msg = "Top 3:\n"
+        for name, score in scores[:3]:
+            top_3_msg += f"{name}: {score:.1f}%\n"
+        self.debug_label.setText(top_3_msg)
+        print(f"Result: {scores[:3]}")
 
-        # Threshold check using Dynamic Difficulty
-        if best_score > self.passing_threshold and best_name:
+        if scores and scores[0][1] > self.passing_threshold:
+            best_name, best_score = scores[0]
             self.action_counts[best_name] += 1
-            self.current_action_label.setText(f"偵測到: {best_name}")
-            
-            self.cooldown_counter = 45 
-            self.frame_buffer.clear()
-            
+            self.current_action_label.setText(f"✅ {best_name} ({best_score:.0f}%)")
+            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
             self._update_stats_display()
         else:
-            self.current_action_label.setText("偵測中...")
-            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;")
+            self.current_action_label.setText(f"❌ 未識別 (最高 {scores[0][1]:.0f}%)")
+            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #F44336; border: 2px solid #F44336; border-radius: 10px; padding: 10px;")
+
+    # --- HELPERS ---
+    def _populate_cameras(self):
+        cams = get_working_cameras()
+        self.combo_camera.clear()
+        for idx, backend, name in cams:
+            self.combo_camera.addItem(name, (idx, backend))
+        idx = self.combo_camera.findData(self.app_state.camera_config)
+        if idx != -1: self.combo_camera.setCurrentIndex(idx)
+
+    def _on_camera_changed(self, index):
+        data = self.combo_camera.currentData()
+        if data is not None:
+            self.app_state.camera_config = data
+            if self.is_running:
+                self._stop_recognition()
+                self._start_recognition()
+
+    def _on_difficulty_changed(self, index):
+        if index == 0: self.passing_threshold = 30
+        elif index == 1: self.passing_threshold = 55
+        elif index == 2: self.passing_threshold = 75
+        print(f"Threshold: >{self.passing_threshold}%")
 
     def _update_stats_display(self):
         text = ""
@@ -1206,31 +1342,57 @@ class RecognitionPage(QWidget):
         h, w, ch = img.shape
         bytes_per_line = ch * w
         qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        scaled = qt_image.scaled(
-            self.camera_widget.label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        scaled = qt_image.scaled(self.camera_widget.label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.camera_widget.label.setPixmap(QPixmap.fromImage(scaled))
 
     def _draw_skeleton(self, image, keypoints):
-        skeleton_connections = [
-            (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-            (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-        ]
-        for connection in skeleton_connections:
-            start_idx, end_idx = connection
+        skeleton_connections = [(0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
+        for start_idx, end_idx in skeleton_connections:
             if start_idx < len(keypoints) and end_idx < len(keypoints):
-                start_point = tuple(keypoints[start_idx].astype(int))
-                end_point = tuple(keypoints[end_idx].astype(int))
-                if start_point[0] > 0 and start_point[1] > 0 and end_point[0] > 0 and end_point[1] > 0:
-                    cv2.line(image, start_point, end_point, (0, 255, 0), 2)
+                pt1 = tuple(keypoints[start_idx].astype(int))
+                pt2 = tuple(keypoints[end_idx].astype(int))
+                if pt1[0]>0 and pt1[1]>0 and pt2[0]>0 and pt2[1]>0:
+                    cv2.line(image, pt1, pt2, (0, 255, 0), 2)
         return image
+
+    def _reload_database(self):
+        self._load_templates()
+        QMessageBox.information(self, "重整完成", f"已重新載入 {len(self.loaded_templates)} 個動作模板。")
+
+    def _clean_invalid_records(self):
+        postures = self.sqlite3_database.fetch_all_postures()
+        removed_count = 0
+        for p in postures:
+            if not Path(p["video_path"]).exists() or not Path(p["npy_path"]).exists():
+                try: self.sqlite3_database.delete_posture(p["posture_name"]); removed_count += 1
+                except: pass
+        if removed_count > 0:
+            self._reload_database()
+            QMessageBox.information(self, "清理完成", f"已移除 {removed_count} 筆無效紀錄。")
+        else:
+            QMessageBox.information(self, "清理", "沒有發現無效紀錄。")
+
+    def _start_recognition(self):
+        if not self.loaded_templates:
+            QMessageBox.warning(self, "Warning", "無動作資料！")
+            return
+        cam_idx, cam_backend = self.app_state.camera_config
+        self.camera_cap = cv2.VideoCapture(cam_idx, cam_backend)
+        if not self.camera_cap.isOpened(): return
+        self.is_running = True
+        self.detection_timer.start(30)
+
+    def _stop_recognition(self):
+        self.is_running = False
+        self.detection_timer.stop()
+        if self.camera_cap: self.camera_cap.release()
+        self.camera_widget.stop()
+        self.current_action_label.setText("已停止")
+        self.state = "IDLE"
 
     def _on_back(self):
         self._stop_recognition()
         self.back_callback()
-
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
