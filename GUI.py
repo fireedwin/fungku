@@ -994,19 +994,21 @@ class RecognitionPage(QWidget):
         self.detection_timer = QTimer()
         self.detection_timer.timeout.connect(self._process_frame)
         
-        # State Machine
-        self.state = "IDLE" 
-        self.recording_buffer = [] 
+        # --- 滑動視窗邏輯 ---
+        # 75 frames = 2.5秒
+        self.motion_buffer = deque(maxlen=75) 
         self.loaded_templates = {} 
         self.action_counts = {}
         
         # --- Settings ---
-        self.motion_start_threshold = 0.4  
-        self.target_recording_frames = 12
         self.passing_threshold = 50        
+        self.display_bonus = 30            
+        self.check_interval = 0            
         self.cooldown_counter = 0          
+        self.last_best_score = 0           
 
-        # Controls
+        # --- UI SETUP ---
+        # 1. Controls
         self.combo_camera = QComboBox()
         self.combo_camera.setPlaceholderText("選擇攝影機")
         self.combo_camera.setFixedWidth(150)
@@ -1021,7 +1023,14 @@ class RecognitionPage(QWidget):
         self.combo_difficulty.setFixedWidth(150)
         self.combo_difficulty.setFixedHeight(40)
 
-        # Buttons
+        # 2. Buttons
+        # [NEW] 歸零按鈕
+        btn_reset = QPushButton("歸零 (Reset)")
+        btn_reset.clicked.connect(self._reset_counters)
+        btn_reset.setFixedWidth(100)
+        btn_reset.setFixedHeight(40)
+        btn_reset.setStyleSheet("background-color: #FF9800; border: none; color: white; font-weight: bold;")
+
         btn_reload = QPushButton("🔄 重整")
         btn_reload.clicked.connect(self._reload_database)
         btn_reload.setFixedWidth(80)
@@ -1046,25 +1055,26 @@ class RecognitionPage(QWidget):
         btn_back.clicked.connect(self._on_back)
         btn_back.setFixedHeight(40)
 
-        # Components
+        # 3. Components
         self.camera_widget = VideoWidget()
 
         self.stats_label = QLabel("等待開始...")
         self.stats_label.setStyleSheet("font-size: 18px; color: #FFFFFF; line-height: 150%;")
         self.stats_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        self.current_action_label = QLabel("請開始動作")
+        self.current_action_label = QLabel("準備中...")
         self.current_action_label.setStyleSheet(
             "font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;"
         )
         self.current_action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.debug_label = QLabel("State: IDLE")
-        self.debug_label.setStyleSheet("font-size: 14px; color: #FFA500;")
+        # [MODIFIED] Debug Label 作為即時儀表板
+        self.debug_label = QLabel("| 等待數據... |")
+        self.debug_label.setStyleSheet("font-size: 14px; color: #00E5FF; background-color: rgba(0,0,0,0.3); padding: 5px;")
         self.debug_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.debug_label.setWordWrap(True)
+        self.debug_label.setWordWrap(True) # 允許換行以顯示所有動作
 
-        # Layouts
+        # 4. Layouts
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 60, 10)
         
@@ -1074,10 +1084,10 @@ class RecognitionPage(QWidget):
 
         header_layout.addWidget(title_label)
         header_layout.addStretch()
-        header_layout.addWidget(QLabel("攝影機:"))
+        header_layout.addWidget(QLabel("Cam:"))
         header_layout.addWidget(self.combo_camera)
-        header_layout.addWidget(QLabel("難度:"))
         header_layout.addWidget(self.combo_difficulty)
+        header_layout.addWidget(btn_reset) # 加入歸零按鈕
         header_layout.addWidget(btn_reload)
         header_layout.addWidget(btn_clean)
         header_layout.addWidget(btn_start)
@@ -1091,7 +1101,7 @@ class RecognitionPage(QWidget):
         
         stats_layout = QVBoxLayout()
         stats_layout.addWidget(self.current_action_label)
-        stats_layout.addWidget(self.debug_label)
+        stats_layout.addWidget(self.debug_label) # 儀表板放在這裡
         stats_layout.addSpacing(20)
         stats_layout.addWidget(QLabel("--- 練習統計 ---"))
         stats_layout.addWidget(self.stats_label, 1) 
@@ -1106,99 +1116,67 @@ class RecognitionPage(QWidget):
 
     # --- 1. CORE MATH ---
     def _normalize_keypoints(self, kpts: np.ndarray) -> np.ndarray:
-        """ Torso-Anchored Normalization """
         kpts = np.array(kpts, dtype=np.float32)
         if kpts.ndim == 3: kpts = kpts[:, :2]
         elif kpts.shape[-1] == 3: kpts = kpts[:, :2]
         
         hip_center = (kpts[11] + kpts[12]) / 2.0
         centered = kpts - hip_center
-        
         shoulder_center = (kpts[5] + kpts[6]) / 2.0
         torso_size = np.linalg.norm(shoulder_center - hip_center)
         if torso_size < 1.0: torso_size = 1.0
-        
         return centered / torso_size
 
     def _extract_features(self, sequence):
-        """
-        Advanced Feature Extraction for Wuxing Fists.
-        Returns Shape: (Frames, 36) -> 34 Pos coords + 2 Special Features
-        """
-        seq_array = np.array(sequence) # (Frames, 17, 2)
-        
-        # --- A. Weighted Positions (34 dims) ---
+        seq_array = np.array(sequence) 
         positions = seq_array.reshape(seq_array.shape[0], -1)
+        
         weights = np.ones((17, 2), dtype=np.float32)
-        weights[7:11, :] = 3.0 # Boost Wrists/Elbows
-        weights[5:7, :] = 1.5  # Boost Shoulders
+        weights[7:11, :] = 3.0 
+        weights[5:7, :] = 1.5
         weighted_positions = positions * weights.flatten()
         
-        # --- B. Special Features (Geometric) ---
-        
-        # 1. Hand Span (木手特徵): Distance between wrists
-        # L_Wrist=9, R_Wrist=10
         l_wrist = seq_array[:, 9, :] 
         r_wrist = seq_array[:, 10, :]
-        hand_span = np.linalg.norm(l_wrist - r_wrist, axis=1).reshape(-1, 1)
-        
-        # 2. Vertical Hand Diff (金手特徵): Abs Y-diff between wrists
-        # "Chopping" usually creates vertical separation
-        vertical_diff = np.abs(l_wrist[:, 1] - r_wrist[:, 1]).reshape(-1, 1)
-        
-        # 3. Arm Extension (火手特徵): Distance from Shoulder to Wrist
-        # This detects "Pushing out". We verify average extension of both arms.
-        # L_Shoulder=5, R_Shoulder=6
         l_shoulder = seq_array[:, 5, :]
         r_shoulder = seq_array[:, 6, :]
         
-        l_ext = np.linalg.norm(l_wrist - l_shoulder, axis=1)
-        r_ext = np.linalg.norm(r_wrist - r_shoulder, axis=1)
-        # Average extension of both arms
-        arm_extension = ((l_ext + r_ext) / 2.0).reshape(-1, 1)
-
-        # Apply heavy weights to these special features to force differentiation
-        hand_span = hand_span * 4.0        # For Wood
-        vertical_diff = vertical_diff * 4.0 # For Metal
-        arm_extension = arm_extension * 4.0 # For Fire
+        hand_span = np.linalg.norm(l_wrist - r_wrist, axis=1).reshape(-1, 1) * 5.0
+        vertical_diff = np.abs(l_wrist[:, 1] - r_wrist[:, 1]).reshape(-1, 1) * 5.0
+        arm_ext = ((np.linalg.norm(l_wrist - l_shoulder, axis=1) + np.linalg.norm(r_wrist - r_shoulder, axis=1)) / 2.0).reshape(-1, 1) * 5.0
         
-        # Combine all: [Pos(34), Span(1), VertDiff(1), Extension(1)] -> 37 dims
-        features = np.concatenate([
-            weighted_positions, 
-            hand_span, 
-            vertical_diff, 
-            arm_extension
-        ], axis=1)
-        
-        return features
+        return np.concatenate([weighted_positions, hand_span, vertical_diff, arm_ext], axis=1)
 
-    # --- 2. LOAD TEMPLATES ---
+    # --- 2. LOAD & RESET ---
     def _load_templates(self):
         self.loaded_templates = {}
         postures = self.sqlite3_database.fetch_all_postures()
-        
         print("\n=== LOADING TEMPLATES ===")
         for p in postures:
             npy_path = p["npy_path"]
             name = p["posture_name"]
             path_obj = Path(npy_path)
-            
             if path_obj.exists():
                 try:
                     poses = np.load(str(path_obj))
                     if len(poses) > 10:
                         norm_seq = [self._normalize_keypoints(pose) for pose in poses]
                         feat_seq = self._extract_features(norm_seq)
-                        
                         self.loaded_templates[name] = feat_seq
-                        self.action_counts[name] = 0
-                        print(f"  [OK] {name}: {len(feat_seq)} frames")
+                        self.action_counts[name] = 0 # Init count
+                        print(f"  [OK] {name}")
                 except Exception: pass
-            else:
-                print(f"  [MISSING] {name}")
         self._update_stats_display()
 
-    # --- 3. PROCESS FRAME ---
+    # [NEW] 重置計數器功能
+    def _reset_counters(self):
+        for name in self.action_counts:
+            self.action_counts[name] = 0
+        self._update_stats_display()
+        self.current_action_label.setText("計數已歸零")
+        QMessageBox.information(self, "Reset", "練習次數已歸零！")
+
+    # --- 3. SLIDING WINDOW PROCESS ---
     def _process_frame(self):
         if not self.is_running or not self.camera_cap: return
 
@@ -1207,6 +1185,12 @@ class RecognitionPage(QWidget):
 
         if self.cooldown_counter > 0:
             self.cooldown_counter -= 1
+            if self.cooldown_counter == 0:
+                self.current_action_label.setText("準備中...")
+                self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; padding: 10px;")
+                self.motion_buffer.clear() 
+                self.last_best_score = 0
+            
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self._update_camera_widget(frame_rgb)
             return
@@ -1224,56 +1208,26 @@ class RecognitionPage(QWidget):
 
         if current_kpts is None: return
 
-        # 1. Normalize
         norm_pose = self._normalize_keypoints(current_kpts)
+        self.motion_buffer.append(norm_pose) 
         
-        # 2. Check Motion
-        flat_pose = norm_pose.flatten()
-        if not hasattr(self, 'motion_window'): self.motion_window = deque(maxlen=5)
-        self.motion_window.append(flat_pose)
-        motion_variance = self._calculate_variance(self.motion_window)
+        self.check_interval += 1
+        if self.check_interval % 3 == 0 and len(self.motion_buffer) > 20:
+            self._scan_buffer()
+
+    def _scan_buffer(self):
+        """ 掃描並更新儀表板 """
+        user_features = self._extract_features(self.motion_buffer)
         
-        # STATE MACHINE
-        if self.state == "IDLE":
-            self.debug_label.setText(f"Ready... (Var: {motion_variance:.2f})")
-            if motion_variance > self.motion_start_threshold:
-                self.state = "RECORDING"
-                self.recording_buffer = [] 
-                self.current_action_label.setText("🔴 錄製中...")
-                self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #FF5722; border: 2px solid #FF5722; border-radius: 10px; padding: 10px;")
-                print(">>> START RECORDING")
-
-        elif self.state == "RECORDING":
-            self.recording_buffer.append(norm_pose)
-            
-            frames_recorded = len(self.recording_buffer)
-            self.debug_label.setText(f"REC: {frames_recorded}/{self.target_recording_frames}")
-            
-            if frames_recorded >= self.target_recording_frames:
-                print(f">>> Full Buffer ({frames_recorded}). Evaluating...")
-                self._evaluate_sequence(self.recording_buffer)
-                self.cooldown_counter = 20 
-                self.state = "IDLE"
-
-    def _calculate_variance(self, buffer):
-        if len(buffer) < 2: return 0.0
-        data = np.array(buffer)
-        return np.sum(np.std(data, axis=0))
-
-    def _evaluate_sequence(self, recorded_seq_raw):
-        # 1. Convert to Features
-        user_features = self._extract_features(recorded_seq_raw)
-        
-        # 2. Flipped Version
         recorded_seq_flipped = []
-        for pose in recorded_seq_raw:
+        for pose in self.motion_buffer:
             flipped = pose.copy()
-            flipped[:, 0] = -flipped[:, 0] # Flip X
+            flipped[:, 0] = -flipped[:, 0] 
             recorded_seq_flipped.append(flipped)
         user_features_flipped = self._extract_features(recorded_seq_flipped)
 
-        scores = [] 
-
+        scores = []
+        
         for name, template_features in self.loaded_templates.items():
             if len(template_features) < 10: continue
             
@@ -1284,31 +1238,57 @@ class RecognitionPage(QWidget):
                 max_len = max(len(user_features), len(template_features))
                 avg_dist = min_dist / max_len
                 
-                # Similarity
                 similarity = np.exp(-0.15 * avg_dist) * 100
                 scores.append((name, similarity))
-                
             except Exception: continue
 
-        scores.sort(key=lambda x: x[1], reverse=True)
+        # [NEW] 儀表板顯示邏輯
+        # 1. 先按名字排序，確保顯示順序固定 (方便閱讀)
+        scores_sorted_by_name = sorted(scores, key=lambda x: x[0])
         
-        top_3_msg = "Top 3:\n"
-        for name, score in scores[:3]:
-            top_3_msg += f"{name}: {score:.1f}%\n"
-        self.debug_label.setText(top_3_msg)
-        print(f"Result: {scores[:3]}")
+        dashboard_text = ""
+        for name, score in scores_sorted_by_name:
+            # 高亮顯示高分項目
+            color_hex = "#FFFFFF" # 預設白
+            if score > self.passing_threshold: color_hex = "#00E5FF" # 青色 (及格)
+            if score > 80: color_hex = "#00FF00" # 綠色 (優秀)
+            
+            dashboard_text += f"| <span style='color:{color_hex};'>{name}: {score:.0f}%</span> "
+        dashboard_text += "|"
+        
+        self.debug_label.setText(dashboard_text)
 
-        if scores and scores[0][1] > self.passing_threshold:
+        # 2. 再按分數排序，用於判定最佳動作
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        if scores:
             best_name, best_score = scores[0]
-            self.action_counts[best_name] += 1
-            self.current_action_label.setText(f"✅ {best_name} ({best_score:.0f}%)")
-            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
-            self._update_stats_display()
-        else:
-            self.current_action_label.setText(f"❌ 未識別 (最高 {scores[0][1]:.0f}%)")
-            self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #F44336; border: 2px solid #F44336; border-radius: 10px; padding: 10px;")
+            
+            if best_score > self.passing_threshold:
+                if best_score > 85: 
+                     self._trigger_success(best_name, best_score)
+                elif best_score < self.last_best_score and self.last_best_score > self.passing_threshold:
+                    self._trigger_success(best_name, self.last_best_score)
+                
+                self.last_best_score = best_score
+            else:
+                self.last_best_score = 0
 
-    # --- HELPERS ---
+    def _trigger_success(self, name, score):
+        display_score = min(100, score + self.display_bonus)
+        
+        self.action_counts[name] += 1
+        self.current_action_label.setText(f"✅ {name} ({display_score:.0f}%)")
+        self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
+        self._update_stats_display()
+        
+        print(f">>> SUCCESS: {name} ({display_score:.0f}%)")
+        
+        self.cooldown_counter = 40 
+        self.last_best_score = 0
+        self.motion_buffer.clear() 
+
+    # --- HELPERS (SAME) ---
     def _populate_cameras(self):
         cams = get_working_cameras()
         self.combo_camera.clear()
@@ -1327,7 +1307,7 @@ class RecognitionPage(QWidget):
 
     def _on_difficulty_changed(self, index):
         if index == 0: self.passing_threshold = 30
-        elif index == 1: self.passing_threshold = 55
+        elif index == 1: self.passing_threshold = 50
         elif index == 2: self.passing_threshold = 75
         print(f"Threshold: >{self.passing_threshold}%")
 
@@ -1380,6 +1360,7 @@ class RecognitionPage(QWidget):
         self.camera_cap = cv2.VideoCapture(cam_idx, cam_backend)
         if not self.camera_cap.isOpened(): return
         self.is_running = True
+        self.motion_buffer.clear() 
         self.detection_timer.start(30)
 
     def _stop_recognition(self):
@@ -1388,7 +1369,6 @@ class RecognitionPage(QWidget):
         if self.camera_cap: self.camera_cap.release()
         self.camera_widget.stop()
         self.current_action_label.setText("已停止")
-        self.state = "IDLE"
 
     def _on_back(self):
         self._stop_recognition()
