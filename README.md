@@ -211,18 +211,17 @@ KungFu/
 
 ### 🤸 自由練習模式 (Free Practice Mode)
 
-1. 在主選單點擊「**自由練習**」按鈕
-2. 選擇練習難度:
-   - **簡單 (Easy)**: 通過門檻 30%，適合初學者熟悉動作
-   - **普通 (Normal)**: 通過門檻 50%，適合日常練習 (預設)
-   - **困難 (Hard)**: 通過門檻 80%，適合追求完美的武者
-3. 點擊「**開始偵測**」啟動攝影機
-4. 在鏡頭前做出資料庫中已錄製的任何動作（如：金手、水手等）
-5. 系統會即時分析：
-   - **狀態顯示**: 顯示當前是「靜止」還是「偵測中」
-   - **識別成功**: 顯示動作名稱與相似度分數，並自動累積次數
-6. 完成動作後會有冷卻時間 (Cooldown)，防止重複計數
-7. 點擊「**停止**」結束練習並查看統計結果
+
+- **固定窗口識別 (Fixed-Window Recognition)**:
+  - 系統偵測到動作開始後，會自動鎖定並錄製固定長度（約 1-2 秒），確保完整捕捉「起手-發力-收招」的全過程，解決只偵測到起手式的問題。（仲改緊bug）
+- **五行手特徵強化**:
+  - 針對金、木、水、火、土五種動作進行特徵優化，加入 **手部開合 (Hand Span)**、**垂直落差** 與 **手臂延伸** 等幾何特徵，有效區分相似動作（如分辨「水手」與「木手」）。
+- **智慧狀態機**:
+  - **IDLE**: 待機偵測微小晃動。
+  - **RECORDING**: 觸發後強制錄滿指定幀數。
+  - **EVALUATING**: 自動結算並顯示前三名相似動作。
+  - **COOLDOWN**: 防止重複計分。
+- **資料庫管理工具**: 內建「🔄 重整」與「🧹 清理」按鈕，可一鍵清除無效的檔案連結，解決檔案刪除後資料庫不同步的問題。
 
 ## 🔬 核心演算法 (Core Algorithms)
 
@@ -297,15 +296,7 @@ def compute_similarity(seq_a, seq_b):
       self.debug_label.setText(f"狀態: 靜止 (Motion: {avg_speed:.3f})")
       return  # <--- 這裡就是門檻，不動就直接擋掉
    ```
-2. **軀幹比例正規化 (Torso-Scale Normalization)**: 使用頸部到臀部的距離作為基準單位，解決了使用者距離鏡頭遠近造成的尺度差異，同時保留了前後拳的深度資訊（Depth Cues）。
-   # 在 _compute_spatial_features 裡面
-   ```python
-   torso_size = np.linalg.norm(shoulder_mid - hip_mid)
-   ... (略)
-   norm_vec = vec / torso_size  # <--- 這裡就是正規化，把長度變成相對比例
-   features.extend(norm_vec)
-   ```
-3. **自動鏡像匹配 (Auto-Mirroring)**: 系統同時計算原始骨架與水平翻轉骨架的 DTW 距離，取最佳值作為最終分數，解決了網路攝影機鏡像翻轉的問題。
+2. **自動鏡像匹配 (Auto-Mirroring)**: 系統同時計算原始骨架與水平翻轉骨架的 DTW 距離，取最佳值作為最終分數，解決了網路攝影機鏡像翻轉的問題。
    # 在 _recognize_action 裡面
    # 1. 創造翻轉版數據
    ```python
@@ -321,6 +312,18 @@ def compute_similarity(seq_a, seq_b):
    ... (略)
    min_dist = min(dist_norm, dist_flip) # <--- 自動選比較像的那邊
    ```
+
+3. 軀幹定錨正規化 (Torso-Anchored Normalization)
+傳統的正規化會消除所有尺度差異，導致無法區分「手伸直」與「手彎曲」。我們改用 **脊椎長度 (肩膀中心到臀部中心)** 作為基準尺。
+- **優點**: 保留了手部前後伸縮的 **深度資訊 (Depth Cues)**，能準確識別「火手（推）」與「土手（抱）」的差異。
+
+```python
+# 核心邏輯
+shoulder_center = (kpts[5] + kpts[6]) / 2.0
+hip_center = (kpts[11] + kpts[12]) / 2.0
+torso_size = np.linalg.norm(shoulder_center - hip_center)
+normalized_pose = (kpts - hip_center) / torso_size
+```
 **演算法特點:**
 
 - **時間不變性**: DTW 允許序列以不同速度執行
