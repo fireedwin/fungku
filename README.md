@@ -295,12 +295,11 @@ def compute_similarity(seq_a, seq_b):
    if avg_speed < 0.015:
       self.debug_label.setText(f"狀態: 靜止 (Motion: {avg_speed:.3f})")
       return  # <--- 這裡就是門檻，不動就直接擋掉
+
 2. **軀幹比例正規化 (Torso-Scale Normalization)**: 使用頸部到臀部的距離作為基準單位，解決了使用者距離鏡頭遠近造成的尺度差異，同時保留了前後拳的深度資訊（Depth Cues）。
    # 在 _compute_spatial_features 裡面
    torso_size = np.linalg.norm(shoulder_mid - hip_mid)
-
-   # ... (略)
-
+   ... (略)
    norm_vec = vec / torso_size  # <--- 這裡就是正規化，把長度變成相對比例
    features.extend(norm_vec)
 
@@ -312,12 +311,10 @@ def compute_similarity(seq_a, seq_b):
       feat_flipped[0::2] = -feat_flipped[0::2] # 把 X 軸數值變負號 (翻轉)
       live_seq_flipped.append(feat_flipped)
 
-   # ... (略)
-
    # 2. 兩個都比對，取最小值 (min_dist)
    dist_norm, _ = fastdtw(live_seq_normal, template_seq, dist=euclidean)
    dist_flip, _ = fastdtw(live_seq_flipped, template_seq, dist=euclidean)
-
+   ... (略)
    min_dist = min(dist_norm, dist_flip) # <--- 自動選比較像的那邊
 
 **演算法特點:**
