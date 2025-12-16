@@ -290,33 +290,37 @@ def compute_similarity(seq_a, seq_b):
 
 1. **移動門檻 (Movement Gate)**: 計算時間窗口內的總位移量，若使用者處於靜止狀態，自動略過計算以節省資源並防止誤判。
    # 在 _recognize_action 裡面
+   ```python
    avg_speed = self._calculate_motion(self.frame_buffer)
 
    if avg_speed < 0.015:
       self.debug_label.setText(f"狀態: 靜止 (Motion: {avg_speed:.3f})")
       return  # <--- 這裡就是門檻，不動就直接擋掉
-
+   ```
 2. **軀幹比例正規化 (Torso-Scale Normalization)**: 使用頸部到臀部的距離作為基準單位，解決了使用者距離鏡頭遠近造成的尺度差異，同時保留了前後拳的深度資訊（Depth Cues）。
    # 在 _compute_spatial_features 裡面
+   ```python
    torso_size = np.linalg.norm(shoulder_mid - hip_mid)
    ... (略)
    norm_vec = vec / torso_size  # <--- 這裡就是正規化，把長度變成相對比例
    features.extend(norm_vec)
-
+   ```
 3. **自動鏡像匹配 (Auto-Mirroring)**: 系統同時計算原始骨架與水平翻轉骨架的 DTW 距離，取最佳值作為最終分數，解決了網路攝影機鏡像翻轉的問題。
    # 在 _recognize_action 裡面
    # 1. 創造翻轉版數據
+   ```python
    for feat in live_seq_normal:
       feat_flipped = feat.copy()
       feat_flipped[0::2] = -feat_flipped[0::2] # 把 X 軸數值變負號 (翻轉)
       live_seq_flipped.append(feat_flipped)
-
+   ```
    # 2. 兩個都比對，取最小值 (min_dist)
+   ```python
    dist_norm, _ = fastdtw(live_seq_normal, template_seq, dist=euclidean)
    dist_flip, _ = fastdtw(live_seq_flipped, template_seq, dist=euclidean)
    ... (略)
    min_dist = min(dist_norm, dist_flip) # <--- 自動選比較像的那邊
-
+   ```
 **演算法特點:**
 
 - **時間不變性**: DTW 允許序列以不同速度執行
