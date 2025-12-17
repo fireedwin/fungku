@@ -799,6 +799,11 @@ class GuidingPage(QWidget):
         self.back_callback()
 
 class RecognitionPage(QWidget):
+    """
+    V2: Professor's Approach
+    - Focus on ARM keypoints only (5-10: shoulders, elbows, wrists)
+    - Segment-based detection: detect movement start → capture N frames → match
+    """
     def __init__(self, app_state: AppState, back_callback: Callable) -> None:
         super().__init__()
         self.app_state = app_state
@@ -808,30 +813,38 @@ class RecognitionPage(QWidget):
         
         self.setAutoFillBackground(True)
 
-        # Logic Variables
+        # === STATE MACHINE ===
+        self.STATE_IDLE = 0      # Waiting for movement
+        self.STATE_CAPTURING = 1 # Recording frames
+        self.STATE_COOLDOWN = 2  # Brief pause after recognition
+        
+        self.current_state = self.STATE_IDLE
+        self.capture_buffer = []  # Frames captured during movement
+        self.frame_counter = 0
+        
+        # === DETECTION SETTINGS (for NORMALIZED 0-1 coordinates) ===
+        self.MOVEMENT_THRESHOLD = 0.015   # Min velocity to detect movement start (was 0.03)
+        self.STILLNESS_THRESHOLD = 0.008  # Max velocity to detect stillness (was 0.015)
+        self.MIN_CAPTURE_FRAMES = 12     # Minimum frames to capture
+        self.MAX_CAPTURE_FRAMES = 16     # Maximum frames to capture
+        self.EXPECTED_FRAMES = 20        # Target frame count (avg of 15-25)
+        self.COOLDOWN_FRAMES = 1        # Pause after successful match
+        self.MATCH_THRESHOLD = 45        # Similarity threshold (lowered for testing)
+        
+        # === TRACKING ===
+        self.prev_wrists = None  # Previous wrist positions for velocity calc
+        self.stillness_counter = 0
         self.is_running = False
         self.camera_cap = None
         self.detection_timer = QTimer()
         self.detection_timer.timeout.connect(self._process_frame)
         
-        # --- ROLLING BUFFER ---
-        # 90 frames = approx 3 seconds history
-        self.motion_buffer = deque(maxlen=90) 
-        self.loaded_templates = {} 
+        self.loaded_templates = {}  # name -> arm_features sequence
+        self.template_lengths = {}  # name -> expected frame count
         self.action_counts = {}
-        
-        # --- Settings ---
-        self.passing_threshold = 50  # <--- LOWERED TO 50 FOR EASIER DETECTION
-        self.cooldown = 0
-        self.check_interval = 0
-        
-        # Stability Filters
-        self.stability_counter = 0     
-        self.candidate_cache = None    
-        
         self.last_action_name = "無"
 
-        # --- UI SETUP ---
+        # === UI SETUP ===
         self.combo_camera = QComboBox()
         self.combo_camera.setPlaceholderText("選擇攝影機")
         self.combo_camera.setFixedWidth(150)
@@ -840,8 +853,8 @@ class RecognitionPage(QWidget):
         self.combo_camera.currentIndexChanged.connect(self._on_camera_changed)
 
         self.combo_difficulty = QComboBox()
-        self.combo_difficulty.addItems(["簡單 (Easy)", "普通 (Normal)", "困難 (Hard)"])
-        self.combo_difficulty.setCurrentIndex(0) # Default to Easy
+        self.combo_difficulty.addItems(["簡單 (45%)", "普通 (55%)", "困難 (65%)"])
+        self.combo_difficulty.setCurrentIndex(0)
         self.combo_difficulty.currentIndexChanged.connect(self._on_difficulty_changed)
         self.combo_difficulty.setFixedWidth(150)
         self.combo_difficulty.setFixedHeight(40)
@@ -850,19 +863,11 @@ class RecognitionPage(QWidget):
         btn_reset.clicked.connect(self._reset_counters)
         btn_reset.setFixedWidth(80)
         btn_reset.setFixedHeight(40)
-        btn_reset.setStyleSheet("background-color: #FF9800; border: none; color: white; font-weight: bold;")
 
         btn_reload = QPushButton("🔄 重整")
         btn_reload.clicked.connect(self._reload_database)
         btn_reload.setFixedWidth(80)
         btn_reload.setFixedHeight(40)
-        btn_reload.setStyleSheet("background-color: #607D8B; border: none;")
-
-        btn_clean = QPushButton("🧹 清理")
-        btn_clean.clicked.connect(self._clean_invalid_records)
-        btn_clean.setFixedWidth(80)
-        btn_clean.setFixedHeight(40)
-        btn_clean.setStyleSheet("background-color: #795548; border: none;")
 
         btn_start = QPushButton("開始偵測")
         btn_start.clicked.connect(self._start_recognition)
@@ -888,22 +893,19 @@ class RecognitionPage(QWidget):
         )
         self.current_action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.history_label = QLabel("上一個動作: 無")
-        self.history_label.setStyleSheet("font-size: 16px; color: #FFFF00; background-color: rgba(255, 255, 255, 0.1); padding: 5px;")
-        self.history_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.state_label = QLabel("狀態: 待機")
+        self.state_label.setStyleSheet("font-size: 18px; color: #00E5FF; padding: 5px;")
+        self.state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.debug_label = QLabel("| 系統就緒 |")
-        self.debug_label.setStyleSheet("font-size: 14px; color: #00E5FF; background-color: rgba(0,0,0,0.3); padding: 5px;")
+        self.debug_label.setStyleSheet("font-size: 14px; color: #FFFF00; padding: 5px;")
         self.debug_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.debug_label.setWordWrap(True)
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 60, 10)
-        
-        title_label = QLabel("自由練習")
+        title_label = QLabel("自由練習 V2")
         title_label.setProperty("class", "h2")
-        title_label.setStyleSheet("padding-bottom: 0px;")
-
         header_layout.addWidget(title_label)
         header_layout.addStretch()
         header_layout.addWidget(QLabel("Cam:"))
@@ -911,23 +913,22 @@ class RecognitionPage(QWidget):
         header_layout.addWidget(self.combo_difficulty)
         header_layout.addWidget(btn_reset)
         header_layout.addWidget(btn_reload)
-        header_layout.addWidget(btn_clean)
         header_layout.addWidget(btn_start)
         header_layout.addWidget(btn_stop)
         header_layout.addWidget(btn_back)
 
         content_layout = QHBoxLayout()
         camera_layout = QVBoxLayout()
-        camera_layout.addWidget(QLabel("即時影像"))
+        camera_layout.addWidget(QLabel("即時影像 (手臂追蹤)"))
         camera_layout.addWidget(self.camera_widget, 3)
         
         stats_layout = QVBoxLayout()
         stats_layout.addWidget(self.current_action_label)
-        stats_layout.addWidget(self.history_label) 
-        stats_layout.addWidget(self.debug_label) 
+        stats_layout.addWidget(self.state_label)
+        stats_layout.addWidget(self.debug_label)
         stats_layout.addSpacing(20)
         stats_layout.addWidget(QLabel("--- 練習統計 ---"))
-        stats_layout.addWidget(self.stats_label, 1) 
+        stats_layout.addWidget(self.stats_label, 1)
         
         content_layout.addLayout(camera_layout, 2)
         content_layout.addLayout(stats_layout, 1)
@@ -937,294 +938,368 @@ class RecognitionPage(QWidget):
         main_layout.addLayout(content_layout)
         self.setLayout(main_layout)
 
-    # --- 1. CORE MATH: GEOMETRY ---
+    # ============================================================
+    # PART 1: ARM-ONLY FEATURE EXTRACTION
+    # ============================================================
+    
+    def _extract_arm_keypoints(self, full_kpts):
+        """
+        Extract ONLY arm keypoints (indices 5-10):
+        5=L_shoulder, 6=R_shoulder, 7=L_elbow, 8=R_elbow, 9=L_wrist, 10=R_wrist
+        """
+        if full_kpts.shape[0] < 11:
+            return None
+        return full_kpts[5:11, :2]  # 6 keypoints, x,y only
+    
+    def _normalize_arm_kpts(self, arm_kpts):
+        """Normalize arm keypoints relative to shoulder center"""
+        if arm_kpts is None or len(arm_kpts) < 6:
+            return None
+        # Center on midpoint between shoulders
+        shoulder_center = (arm_kpts[0] + arm_kpts[1]) / 2.0
+        centered = arm_kpts - shoulder_center
+        # Scale by shoulder width
+        shoulder_width = np.linalg.norm(arm_kpts[0] - arm_kpts[1])
+        if shoulder_width < 1e-6:
+            return None
+        normalized = centered / shoulder_width
+        return normalized
+    
+    def _extract_arm_features(self, arm_kpts):
+        """
+        Extract features from arm keypoints:
+        - Normalized positions (6 points * 2 = 12 values)
+        - Elbow angles (2 values)
+        - Wrist-to-shoulder angles (2 values)
+        Total: 16 features
+        """
+        if arm_kpts is None or len(arm_kpts) < 6:
+            return None
+        
+        norm_kpts = self._normalize_arm_kpts(arm_kpts)
+        if norm_kpts is None:
+            return None
+        
+        # Flatten normalized positions
+        pos_features = norm_kpts.flatten()  # 12 values
+        
+        # Elbow angles
+        l_elbow_ang = self._compute_angle(arm_kpts[0], arm_kpts[2], arm_kpts[4]) / 180.0
+        r_elbow_ang = self._compute_angle(arm_kpts[1], arm_kpts[3], arm_kpts[5]) / 180.0
+        
+        # Wrist height relative to shoulder (important for 火/水 distinction)
+        l_wrist_height = (arm_kpts[4, 1] - arm_kpts[0, 1])  # positive = below
+        r_wrist_height = (arm_kpts[5, 1] - arm_kpts[1, 1])
+        
+        # Wrist spread (important for 木 - arms spread wide)
+        wrist_spread = np.linalg.norm(arm_kpts[4] - arm_kpts[5])
+        shoulder_width = np.linalg.norm(arm_kpts[0] - arm_kpts[1])
+        spread_ratio = wrist_spread / max(shoulder_width, 1e-6)
+        
+        features = np.concatenate([
+            pos_features,
+            [l_elbow_ang, r_elbow_ang],
+            [l_wrist_height, r_wrist_height],
+            [spread_ratio]
+        ])
+        return features.astype(np.float32)
+    
     def _compute_angle(self, a, b, c):
-        """ Calculates angle ABC (in degrees) """
+        """Angle ABC in degrees"""
         ba = a - b
         bc = c - b
-        norm_ba = np.linalg.norm(ba)
-        norm_bc = np.linalg.norm(bc)
+        norm_ba, norm_bc = np.linalg.norm(ba), np.linalg.norm(bc)
         if norm_ba < 1e-6 or norm_bc < 1e-6:
-            return 0.0
-        cosine_angle = np.dot(ba, bc) / (norm_ba * norm_bc)
-        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-        return np.degrees(angle)
+            return 90.0
+        cosine = np.dot(ba, bc) / (norm_ba * norm_bc)
+        return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
 
-    def _extract_angular_features(self, kpts):
-        angle_l_elbow = self._compute_angle(kpts[5], kpts[7], kpts[9])
-        angle_r_elbow = self._compute_angle(kpts[6], kpts[8], kpts[10])
-        angle_l_shoulder = self._compute_angle(kpts[11], kpts[5], kpts[7])
-        angle_r_shoulder = self._compute_angle(kpts[12], kpts[6], kpts[8])
-        features = np.array([
-            angle_l_elbow / 180.0,
-            angle_r_elbow / 180.0,
-            angle_l_shoulder / 180.0,
-            angle_r_shoulder / 180.0
-        ], dtype=np.float32)
-        return features
-
-    def _process_sequence_features(self, sequence_poses):
-        feats = []
-        for pose in sequence_poses:
-            if pose.shape[0] == 1 and pose.shape[1] == 17:
-                pose = pose[0]
-            kpts = pose[:, :2]
-            f = self._extract_angular_features(kpts)
-            feats.append(f)
-        return np.array(feats)
-
-    def _trim_static_frames(self, sequence_features, threshold=0.02):
-        if len(sequence_features) < 10: return sequence_features
-        diffs = np.linalg.norm(sequence_features[1:] - sequence_features[:-1], axis=1)
-        active_indices = np.where(diffs > threshold)[0]
-        if len(active_indices) < 5: return sequence_features
-        start_idx = max(0, active_indices[0] - 2)
-        end_idx = min(len(sequence_features), active_indices[-1] + 3)
-        return sequence_features[start_idx:end_idx]
-
-    # --- 2. LOAD TEMPLATES ---
-    def _load_templates(self):
-        self.loaded_templates = {}
-        postures = self.sqlite3_database.fetch_all_postures()
-        print("\n=== LOADING TEMPLATES (CALIBRATED) ===")
+    # ============================================================
+    # PART 2: MOVEMENT DETECTION
+    # ============================================================
+    
+    def _calc_wrist_velocity(self, current_kpts):
+        """Calculate wrist movement velocity"""
+        arm_kpts = self._extract_arm_keypoints(current_kpts)
+        if arm_kpts is None:
+            return 0.0, None
         
+        current_wrists = arm_kpts[4:6]  # L_wrist, R_wrist
+        
+        if self.prev_wrists is None:
+            self.prev_wrists = current_wrists
+            return 0.0, arm_kpts
+        
+        # Calculate displacement
+        displacement = np.linalg.norm(current_wrists - self.prev_wrists)
+        self.prev_wrists = current_wrists.copy()
+        
+        return displacement, arm_kpts
+
+    # ============================================================
+    # PART 3: TEMPLATE LOADING
+    # ============================================================
+    
+    def _load_templates(self):
+        """Load templates - extract ARM features only"""
+        self.loaded_templates = {}
+        self.template_lengths = {}
+        postures = self.sqlite3_database.fetch_all_postures()
+        
+        print("\n=== LOADING ARM-ONLY TEMPLATES ===")
         for p in postures:
             npy_path = p["npy_path"]
             name = p["posture_name"]
-            path_obj = Path(npy_path)
             
-            if path_obj.exists():
-                try:
-                    poses = np.load(str(path_obj))
-                    if len(poses) < 5: continue
-                    feat_seq = self._process_sequence_features(poses)
-                    trimmed_seq = self._trim_static_frames(feat_seq)
-                    if len(trimmed_seq) > 5:
-                        self.loaded_templates[name] = trimmed_seq
-                        if name not in self.action_counts:
-                            self.action_counts[name] = 0
-                        print(f"  [OK] {name}: {len(feat_seq)} -> {len(trimmed_seq)} frames")
-                except Exception as e: 
-                    print(f"  [FAIL] {name}: {e}")
-                    pass
-        self._update_stats_display()
-
-    # --- 3. RECOGNITION LOGIC ---
-    def _judge_action_rules(self, motion_buffer):
-        """ 
-        Advanced Trajectory Judge (Relaxed for Usability)
-        """
-        if len(motion_buffer) < 15: return {}, "Buffering..."
-
-        seq_array = np.array(motion_buffer) 
-        
-        # --- 1. EXTRACT TRAJECTORY ---
-        start_pose = seq_array[0]
-        end_pose = seq_array[-1]
-        
-        # Y-coordinates (Negative = UP)
-        start_wrist_y = (start_pose[9, 1] + start_pose[10, 1]) / 2.0
-        end_wrist_y = (end_pose[9, 1] + end_pose[10, 1]) / 2.0
-        
-        start_shoulder_y = (start_pose[5, 1] + start_pose[6, 1]) / 2.0
-        end_shoulder_y = (end_pose[5, 1] + end_pose[6, 1]) / 2.0
-        
-        start_span = np.linalg.norm(start_pose[9] - start_pose[10])
-        end_span = np.linalg.norm(end_pose[9] - end_pose[10])
-        
-        torso_size = np.linalg.norm(end_pose[5] - end_pose[11]) 
-        
-        # --- 2. DEFINE STATES ---
-        end_height_diff = end_wrist_y - end_shoulder_y
-        is_end_high = end_height_diff < -0.15 * torso_size # Relaxed 0.2 -> 0.15
-        is_end_low = end_height_diff > 0.2 * torso_size
-        is_end_level = not is_end_high and not is_end_low
-        
-        # Displacement (Start -> End)
-        delta_y = end_wrist_y - start_wrist_y
-        is_rising = delta_y < -0.1 * torso_size # Relaxed
-        is_sinking = delta_y > 0.1 * torso_size # Relaxed
-        
-        # --- 3. GEOMETRY CHECKS ---
-        l_elbow_ang = self._compute_angle(end_pose[5], end_pose[7], end_pose[9])
-        r_elbow_ang = self._compute_angle(end_pose[6], end_pose[8], end_pose[10])
-        avg_arm_angle = (l_elbow_ang + r_elbow_ang) / 2.0
-
-        modifiers = {}
-
-        # --- 4. APPLY RULES ---
-
-        # 🔥 Fire: High + Rising OR Straight Arms
-        if is_end_high:
-            if is_rising or avg_arm_angle > 95: # Relaxed 105 -> 95
-                modifiers['Fire'] = 40
-            else:
-                modifiers['Fire'] = -10
-        else:
-            modifiers['Fire'] = -50
-
-        # 💧 Water: Low + Sinking
-        if is_end_low:
-            if is_sinking: 
-                modifiers['Water'] = 50
-            elif start_wrist_y > end_shoulder_y: 
-                # If started low, assume it's Earth/Rest, penalize Water
-                modifiers['Water'] = -10 
-            else:
-                modifiers['Water'] = 10 
-        else:
-            modifiers['Water'] = -50
-
-        # 🌲 Wood: Wide + Level
-        shoulder_width = np.linalg.norm(end_pose[5] - end_pose[6])
-        if end_span > 1.2 * shoulder_width: # Relaxed 1.3 -> 1.2
-            if is_end_level: 
-                modifiers['Wood'] = 50
-            else: 
-                modifiers['Wood'] = -20
-        else:
-            modifiers['Wood'] = -50 
-
-        # ⛰️ Earth: Low + Narrow + Static
-        if is_end_low and end_span < 1.0 * shoulder_width:
-            if not is_sinking: 
-                modifiers['Earth'] = 50
-            else:
-                modifiers['Earth'] = -10 
-        else:
-            modifiers['Earth'] = -50
-
-        # 🏆 Metal: High + Narrower?
-        if is_end_high:
-            modifiers['Metal'] = 30
-        else:
-            modifiers['Metal'] = -50
-
-        move_str = "Rise" if is_rising else ("Sink" if is_sinking else "Stat")
-        debug_info = f"{move_str}|Ht:{'HI' if is_end_high else ('LO' if is_end_low else 'LV')}|Ang:{avg_arm_angle:.0f}"
-        
-        return modifiers, debug_info
-
-    def _scan_buffer(self):
-        if self.cooldown > 0:
-            self.cooldown -= 1
-            return
-
-        if len(self.motion_buffer) < 20: 
-            self.debug_label.setText("| Buffering... |")
-            return
-
-        buffer_array = np.array(self.motion_buffer)
-        live_features = self._process_sequence_features(buffer_array)
-        judge_mods, hud_stats = self._judge_action_rules(self.motion_buffer)
-        
-        live_features_mirror = live_features.copy()
-        live_features_mirror[:, [0, 1]] = live_features_mirror[:, [1, 0]]
-        live_features_mirror[:, [2, 3]] = live_features_mirror[:, [3, 2]]
-
-        scores = []
-        b_len = len(live_features)
-        
-        for name, template_seq in self.loaded_templates.items():
-            t_len = len(template_seq)
-            if b_len < t_len * 0.7: continue
-            
-            slice_len = min(b_len, int(t_len * 1.2))
-            window_slice = live_features[-slice_len:]
-            window_slice_mirror = live_features_mirror[-slice_len:]
+            if not Path(npy_path).exists():
+                print(f"  [SKIP] {name}: file not found")
+                continue
             
             try:
-                dist_norm, _ = fastdtw(window_slice, template_seq, dist=euclidean)
-                dist_mirr, _ = fastdtw(window_slice_mirror, template_seq, dist=euclidean)
-                avg_dist = min(dist_norm, dist_mirr) / max(len(window_slice), t_len)
+                poses = np.load(str(npy_path))
+                print(f"  Loading {name}: shape={poses.shape}")
                 
-                raw_score = np.exp(-3.5 * avg_dist) * 100 
+                if len(poses) < 5:
+                    print(f"  [SKIP] {name}: too few frames ({len(poses)})")
+                    continue
                 
-                final_score = raw_score
-                for key, mod in judge_mods.items():
-                    if key in name: final_score += mod
+                # Extract arm features for each frame
+                arm_features = []
+                for i, pose in enumerate(poses):
+                    # Handle different array shapes
+                    if pose.ndim == 3:
+                        pose = pose[0]
+                    if pose.ndim == 1:
+                        pose = pose.reshape(-1, 2)  # Assume x,y pairs
+                    
+                    # Debug first frame
+                    if i == 0:
+                        print(f"    Frame 0 shape: {pose.shape}, sample: {pose[5:7] if len(pose) > 6 else 'N/A'}")
+                    
+                    arm_kpts = self._extract_arm_keypoints(pose)
+                    feat = self._extract_arm_features(arm_kpts)
+                    if feat is not None:
+                        arm_features.append(feat)
                 
-                final_score = max(0, min(100, final_score))
-                
-                # SHOW SCORES > 10 SO USER SEES PROGRESS
-                if final_score > 10: scores.append((name, final_score))
-            except: continue
-
-        scores.sort(key=lambda x: x[1], reverse=True)
+                if len(arm_features) >= 5:
+                    self.loaded_templates[name] = np.array(arm_features)
+                    self.template_lengths[name] = len(arm_features)
+                    if name not in self.action_counts:
+                        self.action_counts[name] = 0
+                    print(f"  [OK] {name}: {len(arm_features)} frames, feat_dim={arm_features[0].shape}")
+                else:
+                    print(f"  [FAIL] {name}: only {len(arm_features)} valid frames")
+                    
+            except Exception as e:
+                print(f"  [FAIL] {name}: {e}")
         
-        top_name = None
-        top_score = 0
-        if scores:
-            top_name, top_score = scores[0]
-
-        # VISUAL DEBUGGING
-        candidates_text = ""
-        for name, score in scores[:2]:
-            if score > self.passing_threshold:
-                color = "#00FF00" # Green (Pass)
-            else:
-                color = "#888888" # Grey (Fail)
-            candidates_text += f" <span style='color:{color};'>{name}:{score:.0f}</span>"
-            
-        status_color = "#AAA"
-        if self.stability_counter > 0: status_color = "#FFFF00" # Yellow for locking
-        
-        self.debug_label.setText(f"<div style='font-size:12px; color:{status_color};'>{hud_stats}</div><div style='margin-top:4px;'>{candidates_text}</div>")
-
-        # STABILITY LOGIC
-        if top_score > self.passing_threshold:
-            if top_name == self.candidate_cache:
-                self.stability_counter += 1
-            else:
-                self.candidate_cache = top_name
-                self.stability_counter = 1
-                
-            if self.stability_counter >= 2:
-                self._trigger_success(top_name, top_score)
-                self.stability_counter = 0 
-                self.candidate_cache = None
-        else:
-            self.stability_counter = 0
-            self.candidate_cache = None
-
-    def _trigger_success(self, name, score):
-        self.action_counts[name] += 1
-        self.current_action_label.setText(f"✅ {name} ({score:.0f}%)")
-        self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
-        self.last_action_name = f"{name}"
-        self.history_label.setText(f"上一個動作: {name} ({score:.0f}%)")
+        print(f"\n=== LOADED {len(self.loaded_templates)} TEMPLATES ===\n")
         self._update_stats_display()
-        self.motion_buffer.clear() 
-        self.cooldown = 15 
-        self.debug_label.setText(f"| ✅ {name} HIT! |")
 
-    # --- 4. PROCESS FRAME ---
+    # ============================================================
+    # PART 4: SEGMENT MATCHING (DTW on ARM features)
+    # ============================================================
+    
+    def _match_segment(self, captured_features):
+        """Match captured segment against all templates"""
+        if len(captured_features) < self.MIN_CAPTURE_FRAMES:
+            return None, 0
+        
+        captured_array = np.array(captured_features)
+        best_match = None
+        best_score = 0
+        all_scores = []
+        
+        print(f"\n[MATCHING] Captured {len(captured_array)} frames, feature dim: {captured_array.shape}")
+        
+        for name, template in self.loaded_templates.items():
+            try:
+                # DTW comparison
+                dist, _ = fastdtw(captured_array, template, dist=euclidean)
+                avg_dist = dist / max(len(captured_array), len(template))
+                
+                # Convert to similarity score - ADJUSTED SCALING
+                # Lower multiplier = more forgiving
+                score = np.exp(-1.5 * avg_dist) * 100 + 30
+                score = max(0, min(100, score))
+                
+                print(f"  {name}: dist={dist:.2f}, avg={avg_dist:.4f}, score={score:.1f}%")
+                all_scores.append((name, score))
+                
+                if score > best_score:
+                    best_score = score
+                    best_match = name
+                    
+            except Exception as e:
+                print(f"  {name}: ERROR - {e}")
+                continue
+        
+        # Debug: show top scores
+        all_scores.sort(key=lambda x: x[1], reverse=True)
+        debug_text = " | ".join([f"{n}:{s:.0f}" for n, s in all_scores[:3]])
+        self.debug_label.setText(debug_text)
+        
+        return best_match, best_score
+
+    # ============================================================
+    # PART 5: MAIN PROCESSING LOOP (STATE MACHINE)
+    # ============================================================
+    
     def _process_frame(self):
-        if not self.is_running or not self.camera_cap: return
+        if not self.is_running or not self.camera_cap:
+            return
+        
         ret, frame = self.camera_cap.read()
-        if not ret: return
+        if not ret:
+            return
+        
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.posture_detector.model.predict(frame_rgb, verbose=False)
+        
         display_frame = frame_rgb.copy()
         current_kpts = None
+        
         if results and results[0].keypoints is not None and results[0].keypoints.xy.shape[0] > 0:
-            current_kpts = results[0].keypoints.xy[0].cpu().numpy()
-            display_frame = self._draw_skeleton(display_frame, current_kpts)
+            current_kpts_pixel = results[0].keypoints.xy[0].cpu().numpy()  # For drawing
+            current_kpts = results[0].keypoints.xyn[0].cpu().numpy()  # NORMALIZED for matching!
+            # Draw ARM skeleton only (highlight arms)
+            display_frame = self._draw_arm_skeleton(display_frame, current_kpts_pixel)
+        
         self._update_camera_widget(display_frame)
-        if current_kpts is None: return
-        self.motion_buffer.append(current_kpts) 
-        self.check_interval += 1
-        if self.check_interval % 2 == 0: 
-            self._scan_buffer()
+        
+        if current_kpts is None:
+            return
+        
+        # Calculate wrist velocity
+        velocity, arm_kpts = self._calc_wrist_velocity(current_kpts)
+        
+        # === STATE MACHINE ===
+        
+        if self.current_state == self.STATE_IDLE:
+            # Waiting for movement to start
+            self.state_label.setText(f"狀態: 待機 | 速度: {velocity:.3f}")
+            self.state_label.setStyleSheet("font-size: 18px; color: #888; padding: 5px;")
+            
+            if velocity > self.MOVEMENT_THRESHOLD:
+                # Movement detected! Start capturing
+                self.current_state = self.STATE_CAPTURING
+                self.capture_buffer = []
+                self.frame_counter = 0
+                self.stillness_counter = 0
+                print(f"[CAPTURE START] velocity={velocity:.3f}")
+        
+        elif self.current_state == self.STATE_CAPTURING:
+            # Recording frames
+            self.frame_counter += 1
+            
+            # Extract and store arm features
+            feat = self._extract_arm_features(arm_kpts)
+            if feat is not None:
+                self.capture_buffer.append(feat)
+                # Debug: show feature stats on first frame
+                if self.frame_counter == 1:
+                    print(f"[CAPTURE] First frame feat sample: {feat[:4]}")
+            
+            self.state_label.setText(f"狀態: 錄製中 | 幀: {self.frame_counter}/{self.MAX_CAPTURE_FRAMES}")
+            self.state_label.setStyleSheet("font-size: 18px; color: #FF5722; padding: 5px; background: rgba(255,87,34,0.2);")
+            
+            # Check for stillness (movement ended)
+            if velocity < self.STILLNESS_THRESHOLD:
+                self.stillness_counter += 1
+            else:
+                self.stillness_counter = 0
+            
+            # End capture if: max frames reached OR stillness detected after min frames
+            should_end = False
+            if self.frame_counter >= self.MAX_CAPTURE_FRAMES:
+                should_end = True
+            elif self.frame_counter >= self.MIN_CAPTURE_FRAMES and self.stillness_counter >= 5:
+                should_end = True
+            
+            if should_end:
+                # Try to match
+                print(f"[CAPTURE END] {len(self.capture_buffer)} frames captured")
+                match_name, match_score = self._match_segment(self.capture_buffer)
+                
+                if match_name and match_score >= self.MATCH_THRESHOLD:
+                    self._trigger_success(match_name, match_score)
+                else:
+                    self.current_action_label.setText(f"❌ 未識別 ({match_score:.0f}%)")
+                    self.current_action_label.setStyleSheet(
+                        "font-size: 24px; font-weight: bold; color: #888; border: 3px solid #888; border-radius: 10px; padding: 10px;"
+                    )
+                
+                # Enter cooldown
+                self.current_state = self.STATE_COOLDOWN
+                self.frame_counter = 0
+        
+        elif self.current_state == self.STATE_COOLDOWN:
+            # Brief pause before next detection
+            self.frame_counter += 1
+            self.state_label.setText(f"狀態: 冷卻 | {self.COOLDOWN_FRAMES - self.frame_counter}")
+            self.state_label.setStyleSheet("font-size: 18px; color: #2196F3; padding: 5px;")
+            
+            if self.frame_counter >= self.COOLDOWN_FRAMES:
+                self.current_state = self.STATE_IDLE
+                self.capture_buffer = []
+                self.prev_wrists = None  # Reset velocity tracking
 
-    # --- HELPERS ---
+    def _trigger_success(self, name, score):
+        """Called when a posture is successfully recognized"""
+        self.action_counts[name] += 1
+        self.current_action_label.setText(f"✅ {name} ({score:.0f}%)")
+        self.current_action_label.setStyleSheet(
+            "font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px; background: rgba(76,175,80,0.2);"
+        )
+        self.last_action_name = name
+        self._update_stats_display()
+        print(f"[SUCCESS] {name} = {score:.1f}%")
+
+    # ============================================================
+    # PART 6: DRAWING (ARM EMPHASIS)
+    # ============================================================
+    
+    def _draw_arm_skeleton(self, image, keypoints):
+        """Draw skeleton with ARM emphasis"""
+        # Body connections (dim)
+        body_connections = [(5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
+        for s, e in body_connections:
+            if s < len(keypoints) and e < len(keypoints):
+                pt1 = tuple(keypoints[s].astype(int))
+                pt2 = tuple(keypoints[e].astype(int))
+                if pt1[0] > 0 and pt1[1] > 0 and pt2[0] > 0 and pt2[1] > 0:
+                    cv2.line(image, pt1, pt2, (100, 100, 100), 1)  # Dim grey
+        
+        # ARM connections (BRIGHT)
+        arm_connections = [(5, 6), (5, 7), (7, 9), (6, 8), (8, 10)]
+        for s, e in arm_connections:
+            if s < len(keypoints) and e < len(keypoints):
+                pt1 = tuple(keypoints[s].astype(int))
+                pt2 = tuple(keypoints[e].astype(int))
+                if pt1[0] > 0 and pt1[1] > 0 and pt2[0] > 0 and pt2[1] > 0:
+                    cv2.line(image, pt1, pt2, (0, 255, 255), 3)  # Bright cyan
+        
+        # Wrist points (extra emphasis)
+        for idx in [9, 10]:  # Wrists
+            if idx < len(keypoints):
+                pt = tuple(keypoints[idx].astype(int))
+                if pt[0] > 0 and pt[1] > 0:
+                    cv2.circle(image, pt, 8, (255, 0, 255), -1)  # Magenta circles
+        
+        return image
+
+    # ============================================================
+    # PART 7: HELPERS
+    # ============================================================
+    
     def _populate_cameras(self):
         cams = get_working_cameras()
         self.combo_camera.clear()
         for idx, backend, name in cams:
             self.combo_camera.addItem(name, (idx, backend))
         idx = self.combo_camera.findData(self.app_state.camera_config)
-        if idx != -1: self.combo_camera.setCurrentIndex(idx)
+        if idx != -1:
+            self.combo_camera.setCurrentIndex(idx)
 
     def _on_camera_changed(self, index):
         data = self.combo_camera.currentData()
@@ -1235,88 +1310,79 @@ class RecognitionPage(QWidget):
                 self._start_recognition()
 
     def _on_difficulty_changed(self, index):
-        if index == 0: self.passing_threshold = 50
-        elif index == 1: self.passing_threshold = 65
-        elif index == 2: self.passing_threshold = 80
-        print(f"Threshold: >{self.passing_threshold}%")
+        thresholds = [45, 55, 65]
+        self.MATCH_THRESHOLD = thresholds[index]
+        print(f"Match threshold: {self.MATCH_THRESHOLD}%")
 
     def _update_stats_display(self):
         text = ""
         for name, count in self.action_counts.items():
-            color = "#FFFFFF" if count == 0 else "#4CAF50"
-            text += f"<div style='margin-bottom:5px;'><span style='color:{color}; font-weight:bold;'>{name}:</span> {count} 次</div>"
+            color = "#888" if count == 0 else "#4CAF50"
+            text += f"<div><span style='color:{color};font-weight:bold;'>{name}:</span> {count} 次</div>"
         self.stats_label.setText(text)
 
+    def _reset_capture_state(self):
+        """Reset all capture-related state variables"""
+        self.current_state = self.STATE_IDLE
+        self.capture_buffer = []
+        self.frame_counter = 0
+        self.stillness_counter = 0
+        self.prev_wrists = None
+        
+        # Update UI to reflect reset
+        self.state_label.setText("狀態: 待機")
+        self.state_label.setStyleSheet("font-size: 18px; color: #00E5FF; padding: 5px;")
+        self.debug_label.setText("| 系統就緒 |")
+        print("[RESET] Capture state cleared")
+
     def _reset_counters(self):
+        self._reset_capture_state()
         for name in self.action_counts:
             self.action_counts[name] = 0
         self._update_stats_display()
         self.current_action_label.setText("計數已歸零")
-        self.history_label.setText("上一個動作: 無")
         QMessageBox.information(self, "Reset", "練習次數已歸零！")
 
     def _update_camera_widget(self, img):
         h, w, ch = img.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        qt_image = QImage(img.data, w, h, ch * w, QImage.Format.Format_RGB888)
         scaled = qt_image.scaled(self.camera_widget.label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.camera_widget.label.setPixmap(QPixmap.fromImage(scaled))
 
-    def _draw_skeleton(self, image, keypoints):
-        skeleton_connections = [(0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
-        for start_idx, end_idx in skeleton_connections:
-            if start_idx < len(keypoints) and end_idx < len(keypoints):
-                pt1 = tuple(keypoints[start_idx].astype(int))
-                pt2 = tuple(keypoints[end_idx].astype(int))
-                if pt1[0]>0 and pt1[1]>0 and pt2[0]>0 and pt2[1]>0:
-                    cv2.line(image, pt1, pt2, (0, 255, 0), 2)
-        return image
-
     def _reload_database(self):
+        self._reset_capture_state()
         self._load_templates()
-        QMessageBox.information(self, "重整完成", f"已重新載入 {len(self.loaded_templates)} 個動作模板。")
-
-    def _clean_invalid_records(self):
-        postures = self.sqlite3_database.fetch_all_postures()
-        removed_count = 0
-        for p in postures:
-            if not Path(p["video_path"]).exists() or not Path(p["npy_path"]).exists():
-                try: self.sqlite3_database.delete_posture(p["posture_name"]); removed_count += 1
-                except: pass
-        if removed_count > 0:
-            self._reload_database()
-            QMessageBox.information(self, "清理完成", f"已移除 {removed_count} 筆無效紀錄。")
-        else:
-            QMessageBox.information(self, "清理", "沒有發現無效紀錄。")
+        QMessageBox.information(self, "重整", f"已載入 {len(self.loaded_templates)} 個動作模板。")
 
     def _start_recognition(self):
         if not self.loaded_templates:
             self._load_templates()
             if not self.loaded_templates:
-                QMessageBox.warning(self, "Warning", "無動作資料！請先到記錄模式錄製動作。")
+                QMessageBox.warning(self, "Warning", "無動作資料！")
                 return
         
         cam_idx, cam_backend = self.app_state.camera_config
-        try:
-            self.camera_cap = cv2.VideoCapture(cam_idx, cam_backend)
-            if not self.camera_cap.isOpened(): 
-                raise Exception("Camera failed to open")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"無法啟動攝影機: {e}")
+        self.camera_cap = cv2.VideoCapture(cam_idx, cam_backend)
+        if not self.camera_cap.isOpened():
+            QMessageBox.critical(self, "Error", "無法啟動攝影機")
             return
-            
+        
         self.is_running = True
-        self.motion_buffer.clear() 
-        self.detection_timer.start(30)
+        self.current_state = self.STATE_IDLE
+        self.capture_buffer = []
+        self.prev_wrists = None
+        self.detection_timer.start(33)  # ~30 FPS
 
     def _stop_recognition(self):
+        self._reset_capture_state()
         self.is_running = False
         self.detection_timer.stop()
-        if self.camera_cap: self.camera_cap.release()
+        if self.camera_cap:
+            self.camera_cap.release()
         self.camera_widget.stop()
-        self.current_action_label.setText("已停止")
 
     def _on_back(self):
+        self._reset_capture_state()
         self._stop_recognition()
         self.back_callback()
 
