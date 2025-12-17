@@ -33,6 +33,7 @@ from scipy.spatial.distance import euclidean  # type: ignore[import-untyped]
 from ultralytics.engine.results import Results
 
 # Local Imports
+# Ensure you have the helper folder with model.py and database.py in the same directory
 from helper.model import hand_model, pose_model
 from helper.database import sqlite3_database
 
@@ -994,21 +995,20 @@ class RecognitionPage(QWidget):
         self.detection_timer = QTimer()
         self.detection_timer.timeout.connect(self._process_frame)
         
-        # --- 滑動視窗邏輯 ---
-        # 75 frames = 2.5秒
-        self.motion_buffer = deque(maxlen=75) 
+        # --- ROLLING BUFFER ---
+        # 90 frames = approx 3 seconds. Good for most martial arts moves.
+        self.motion_buffer = deque(maxlen=90) 
         self.loaded_templates = {} 
         self.action_counts = {}
         
         # --- Settings ---
-        self.passing_threshold = 50        
-        self.display_bonus = 30            
-        self.check_interval = 0            
-        self.cooldown_counter = 0          
-        self.last_best_score = 0           
+        self.passing_threshold = 60  # Slightly lowered for usability
+        self.cooldown = 0
+        self.check_interval = 0  # <--- FIXED: Variable initialized
+        
+        self.last_action_name = "無"
 
         # --- UI SETUP ---
-        # 1. Controls
         self.combo_camera = QComboBox()
         self.combo_camera.setPlaceholderText("選擇攝影機")
         self.combo_camera.setFixedWidth(150)
@@ -1023,11 +1023,9 @@ class RecognitionPage(QWidget):
         self.combo_difficulty.setFixedWidth(150)
         self.combo_difficulty.setFixedHeight(40)
 
-        # 2. Buttons
-        # [NEW] 歸零按鈕
-        btn_reset = QPushButton("歸零 (Reset)")
+        btn_reset = QPushButton("歸零")
         btn_reset.clicked.connect(self._reset_counters)
-        btn_reset.setFixedWidth(100)
+        btn_reset.setFixedWidth(80)
         btn_reset.setFixedHeight(40)
         btn_reset.setStyleSheet("background-color: #FF9800; border: none; color: white; font-weight: bold;")
 
@@ -1055,26 +1053,27 @@ class RecognitionPage(QWidget):
         btn_back.clicked.connect(self._on_back)
         btn_back.setFixedHeight(40)
 
-        # 3. Components
         self.camera_widget = VideoWidget()
 
         self.stats_label = QLabel("等待開始...")
         self.stats_label.setStyleSheet("font-size: 18px; color: #FFFFFF; line-height: 150%;")
         self.stats_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        self.current_action_label = QLabel("準備中...")
+        self.current_action_label = QLabel("請出招")
         self.current_action_label.setStyleSheet(
-            "font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; border-radius: 10px; padding: 10px;"
+            "font-size: 32px; font-weight: bold; color: #888; border: 3px solid #888; border-radius: 10px; padding: 15px;"
         )
         self.current_action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # [MODIFIED] Debug Label 作為即時儀表板
-        self.debug_label = QLabel("| 等待數據... |")
+        self.history_label = QLabel("上一個動作: 無")
+        self.history_label.setStyleSheet("font-size: 16px; color: #FFFF00; background-color: rgba(255, 255, 255, 0.1); padding: 5px;")
+        self.history_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.debug_label = QLabel("| 系統就緒 |")
         self.debug_label.setStyleSheet("font-size: 14px; color: #00E5FF; background-color: rgba(0,0,0,0.3); padding: 5px;")
         self.debug_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.debug_label.setWordWrap(True) # 允許換行以顯示所有動作
+        self.debug_label.setWordWrap(True)
 
-        # 4. Layouts
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 60, 10)
         
@@ -1087,7 +1086,7 @@ class RecognitionPage(QWidget):
         header_layout.addWidget(QLabel("Cam:"))
         header_layout.addWidget(self.combo_camera)
         header_layout.addWidget(self.combo_difficulty)
-        header_layout.addWidget(btn_reset) # 加入歸零按鈕
+        header_layout.addWidget(btn_reset)
         header_layout.addWidget(btn_reload)
         header_layout.addWidget(btn_clean)
         header_layout.addWidget(btn_start)
@@ -1101,7 +1100,8 @@ class RecognitionPage(QWidget):
         
         stats_layout = QVBoxLayout()
         stats_layout.addWidget(self.current_action_label)
-        stats_layout.addWidget(self.debug_label) # 儀表板放在這裡
+        stats_layout.addWidget(self.history_label) 
+        stats_layout.addWidget(self.debug_label) 
         stats_layout.addSpacing(20)
         stats_layout.addWidget(QLabel("--- 練習統計 ---"))
         stats_layout.addWidget(self.stats_label, 1) 
@@ -1114,86 +1114,295 @@ class RecognitionPage(QWidget):
         main_layout.addLayout(content_layout)
         self.setLayout(main_layout)
 
-    # --- 1. CORE MATH ---
-    def _normalize_keypoints(self, kpts: np.ndarray) -> np.ndarray:
-        kpts = np.array(kpts, dtype=np.float32)
-        if kpts.ndim == 3: kpts = kpts[:, :2]
-        elif kpts.shape[-1] == 3: kpts = kpts[:, :2]
+    # --- 1. CORE MATH: GEOMETRY ---
+    def _compute_angle(self, a, b, c):
+        """ Calculates angle ABC (in degrees) """
+        ba = a - b
+        bc = c - b
         
-        hip_center = (kpts[11] + kpts[12]) / 2.0
-        centered = kpts - hip_center
-        shoulder_center = (kpts[5] + kpts[6]) / 2.0
-        torso_size = np.linalg.norm(shoulder_center - hip_center)
-        if torso_size < 1.0: torso_size = 1.0
-        return centered / torso_size
+        norm_ba = np.linalg.norm(ba)
+        norm_bc = np.linalg.norm(bc)
+        
+        if norm_ba < 1e-6 or norm_bc < 1e-6:
+            return 0.0
 
-    def _extract_features(self, sequence):
-        seq_array = np.array(sequence) 
-        positions = seq_array.reshape(seq_array.shape[0], -1)
+        cosine_angle = np.dot(ba, bc) / (norm_ba * norm_bc)
+        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+        return np.degrees(angle)
+
+    def _extract_angular_features(self, kpts):
+        """ 
+        Converts 17-keypoint pose to a robust feature vector of Angles.
+        """
+        # Keypoints: 5=L_Sh, 7=L_Elb, 9=L_Wrist, 11=L_Hip
+        #            6=R_Sh, 8=R_Elb, 10=R_Wrist, 12=R_Hip
         
-        weights = np.ones((17, 2), dtype=np.float32)
-        weights[7:11, :] = 3.0 
-        weights[5:7, :] = 1.5
-        weighted_positions = positions * weights.flatten()
+        # 1. Elbow Angles (Arm extension)
+        angle_l_elbow = self._compute_angle(kpts[5], kpts[7], kpts[9])
+        angle_r_elbow = self._compute_angle(kpts[6], kpts[8], kpts[10])
         
+        # 2. Shoulder Angles (Arm lift)
+        angle_l_shoulder = self._compute_angle(kpts[11], kpts[5], kpts[7])
+        angle_r_shoulder = self._compute_angle(kpts[12], kpts[6], kpts[8])
+        
+        # Normalize to 0-1 range (approx 0 to 180 degrees)
+        features = np.array([
+            angle_l_elbow / 180.0,
+            angle_r_elbow / 180.0,
+            angle_l_shoulder / 180.0,
+            angle_r_shoulder / 180.0
+        ], dtype=np.float32)
+        
+        return features
+
+    def _process_sequence_features(self, sequence_poses):
+        feats = []
+        for pose in sequence_poses:
+            # Flatten if needed, but we expect (17, 3) or (17, 2)
+            if pose.shape[0] == 1 and pose.shape[1] == 17: # (1, 17, 3) case
+                pose = pose[0]
+            
+            kpts = pose[:, :2] # Use X,Y only
+            f = self._extract_angular_features(kpts)
+            feats.append(f)
+        return np.array(feats)
+
+    def _trim_static_frames(self, sequence_features, threshold=0.02):
+        if len(sequence_features) < 10: return sequence_features
+        diffs = np.linalg.norm(sequence_features[1:] - sequence_features[:-1], axis=1)
+        active_indices = np.where(diffs > threshold)[0]
+        if len(active_indices) < 5: return sequence_features
+        start_idx = max(0, active_indices[0] - 2)
+        end_idx = min(len(sequence_features), active_indices[-1] + 3)
+        return sequence_features[start_idx:end_idx]
+
+    # --- 2. LOAD TEMPLATES ---
+    def _load_templates(self):
+        self.loaded_templates = {}
+        postures = self.sqlite3_database.fetch_all_postures()
+        print("\n=== LOADING TEMPLATES (STRICT MODE) ===")
+        
+        for p in postures:
+            npy_path = p["npy_path"]
+            name = p["posture_name"]
+            path_obj = Path(npy_path)
+            
+            if path_obj.exists():
+                try:
+                    poses = np.load(str(path_obj))
+                    if len(poses) < 5: continue
+                    
+                    feat_seq = self._process_sequence_features(poses)
+                    trimmed_seq = self._trim_static_frames(feat_seq)
+                    
+                    if len(trimmed_seq) > 5:
+                        self.loaded_templates[name] = trimmed_seq
+                        if name not in self.action_counts:
+                            self.action_counts[name] = 0
+                        print(f"  [OK] {name}: {len(feat_seq)} -> {len(trimmed_seq)} frames")
+                except Exception as e: 
+                    print(f"  [FAIL] {name}: {e}")
+                    pass
+        self._update_stats_display()
+
+    def _judge_action_rules(self, motion_buffer):
+        """ 
+        Returns: 
+        1. modifiers (dict): Score adjustments
+        2. debug_info (str): Real-time stats for the HUD
+        """
+        if len(motion_buffer) < 10: return {}, "Initializing..."
+
+        seq_array = np.array(motion_buffer) 
+        
+        # Extract features
         l_wrist = seq_array[:, 9, :] 
         r_wrist = seq_array[:, 10, :]
         l_shoulder = seq_array[:, 5, :]
         r_shoulder = seq_array[:, 6, :]
         
-        hand_span = np.linalg.norm(l_wrist - r_wrist, axis=1).reshape(-1, 1) * 5.0
-        vertical_diff = np.abs(l_wrist[:, 1] - r_wrist[:, 1]).reshape(-1, 1) * 5.0
-        arm_ext = ((np.linalg.norm(l_wrist - l_shoulder, axis=1) + np.linalg.norm(r_wrist - r_shoulder, axis=1)) / 2.0).reshape(-1, 1) * 5.0
+        # 1. Height Analysis
+        avg_shoulder_y = (l_shoulder[:, 1] + r_shoulder[:, 1]) / 2.0
+        avg_wrist_y = (l_wrist[:, 1] + r_wrist[:, 1]) / 2.0
         
-        return np.concatenate([weighted_positions, hand_span, vertical_diff, arm_ext], axis=1)
+        # Use last 10 frames for stability
+        final_wrist_y = np.mean(avg_wrist_y[-10:])
+        final_shoulder_y = np.mean(avg_shoulder_y[-10:])
+        
+        # Hip-Shoulder distance as a reference unit (torso size)
+        torso_size = np.linalg.norm(l_shoulder[0] - seq_array[0, 11, :]) 
+        height_diff = final_wrist_y - final_shoulder_y
+        
+        # Thresholds (relative to torso size)
+        is_high = height_diff < -0.2 * torso_size
+        is_low = height_diff > 0.2 * torso_size
+        is_level = not is_high and not is_low
 
-    # --- 2. LOAD & RESET ---
-    def _load_templates(self):
-        self.loaded_templates = {}
-        postures = self.sqlite3_database.fetch_all_postures()
-        print("\n=== LOADING TEMPLATES ===")
-        for p in postures:
-            npy_path = p["npy_path"]
-            name = p["posture_name"]
-            path_obj = Path(npy_path)
-            if path_obj.exists():
-                try:
-                    poses = np.load(str(path_obj))
-                    if len(poses) > 10:
-                        norm_seq = [self._normalize_keypoints(pose) for pose in poses]
-                        feat_seq = self._extract_features(norm_seq)
-                        self.loaded_templates[name] = feat_seq
-                        self.action_counts[name] = 0 # Init count
-                        print(f"  [OK] {name}")
-                except Exception: pass
+        # 2. Width Analysis
+        spans = np.linalg.norm(l_wrist - r_wrist, axis=1)
+        max_span = np.max(spans)
+        shoulder_widths = np.linalg.norm(l_shoulder - r_shoulder, axis=1)
+        avg_shoulder_width = np.mean(shoulder_widths) + 1e-6
+        width_ratio = max_span / avg_shoulder_width
+
+        # 3. Angle Analysis
+        angles = []
+        l_elbow = seq_array[:, 7, :]
+        r_elbow = seq_array[:, 8, :]
+        for i in range(len(seq_array)):
+            la = self._compute_angle(l_shoulder[i], l_elbow[i], l_wrist[i]) # <--- FIXED HERE
+            ra = self._compute_angle(r_shoulder[i], r_elbow[i], r_wrist[i]) # <--- FIXED HERE
+            angles.append((la + ra) / 2.0)
+        max_angle = np.max(angles)
+        
+        # 4. Speed Analysis
+        y_diffs = avg_wrist_y[1:] - avg_wrist_y[:-1]
+        max_down_speed = np.max(y_diffs) if len(y_diffs) > 0 else 0
+
+        modifiers = {}
+
+        # --- LOGIC (Softened Penalties) ---
+        # Instead of -200 (Death), we use -30 or -50 (Penalty) so the user still sees the score.
+        
+        # 🔥 Fire: Needs Height + Straight Arms
+        if is_high:
+            if max_angle > 110: modifiers['Fire'] = 40
+            else: modifiers['Fire'] = -20 # Correct position, wrong angle
+        else:
+            modifiers['Fire'] = -50 # Wrong position
+
+        # 🌲 Wood: Needs Width + Level Height
+        if width_ratio > 1.3:
+            if is_level: modifiers['Wood'] = 40
+            else: modifiers['Wood'] = -30 # Wide but wrong height
+        else:
+            modifiers['Wood'] = -20 # Not wide enough
+
+        # 💧 Water: Needs Downward Speed + Low End
+        if is_low:
+            if max_down_speed > 0.01: modifiers['Water'] = 40
+            else: modifiers['Water'] = -10 # Low but too slow
+        else:
+            modifiers['Water'] = -50 # Not low
+
+        # ⛰️ Earth: Needs Low End + Narrow Width
+        if is_low:
+            if width_ratio < 1.0: modifiers['Earth'] = 40
+            else: modifiers['Earth'] = -20 # Low but too wide
+        else:
+            modifiers['Earth'] = -50 # Not low
+
+        # 🏆 Metal: High + Narrower than Wood? (Generic High move)
+        if is_high: modifiers['Metal'] = 30
+        else: modifiers['Metal'] = -50
+
+        # --- HUD TEXT ---
+        # Create a tiny status string: "H:High A:120 S:0.02 W:1.5"
+        h_str = "HI" if is_high else ("LO" if is_low else "LV")
+        debug_info = f"Pos:{h_str} | Ang:{max_angle:.0f}° | Spd:{max_down_speed:.3f} | Wid:{width_ratio:.1f}"
+        
+        return modifiers, debug_info
+
+    # --- 3. RECOGNITION LOGIC ---
+    def _scan_buffer(self):
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return
+
+        if len(self.motion_buffer) < 15: 
+            self.debug_label.setText("| Buffering... |")
+            return
+
+        buffer_array = np.array(self.motion_buffer)
+        live_features = self._process_sequence_features(buffer_array)
+        
+        # Get Modifiers AND Debug Info
+        judge_mods, hud_stats = self._judge_action_rules(self.motion_buffer)
+        
+        # Mirror logic
+        live_features_mirror = live_features.copy()
+        live_features_mirror[:, [0, 1]] = live_features_mirror[:, [1, 0]]
+        live_features_mirror[:, [2, 3]] = live_features_mirror[:, [3, 2]]
+
+        scores = []
+        b_len = len(live_features)
+        
+        for name, template_seq in self.loaded_templates.items():
+            t_len = len(template_seq)
+            if b_len < t_len * 0.8: continue 
+            
+            slice_len = min(b_len, int(t_len * 1.2))
+            window_slice = live_features[-slice_len:]
+            window_slice_mirror = live_features_mirror[-slice_len:]
+            
+            try:
+                dist_norm, _ = fastdtw(window_slice, template_seq, dist=euclidean)
+                dist_mirr, _ = fastdtw(window_slice_mirror, template_seq, dist=euclidean)
+                
+                avg_dist = min(dist_norm, dist_mirr) / max(len(window_slice), t_len)
+                
+                # Base Score
+                raw_score = np.exp(-4.0 * avg_dist) * 100
+                
+                # Apply Modifiers
+                final_score = raw_score
+                for key, mod in judge_mods.items():
+                    if key in name: # e.g., "Fire" in "Fire Hand"
+                        final_score += mod
+                
+                # Clamp
+                final_score = max(0, min(100, final_score))
+                
+                if final_score > 10: # Only show if remotely relevant
+                    scores.append((name, final_score))
+                    
+            except Exception: continue
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        
+        # --- UPDATE UI WITH HUD ---
+        # Top line: Technical Stats
+        # Bottom line: Top Candidates
+        candidates_text = ""
+        for name, score in scores[:2]: # Show top 2
+            color = "#00FF00" if score > self.passing_threshold else "#888888"
+            candidates_text += f" <span style='color:{color};'>{name}:{score:.0f}</span>"
+            
+        final_html = f"<div style='font-size:12px; color:#AAAAAA;'>{hud_stats}</div>"
+        if candidates_text:
+            final_html += f"<div style='font-size:14px; margin-top:4px;'>{candidates_text}</div>"
+        else:
+            final_html += "<div style='color:#555;'>No Match</div>"
+            
+        self.debug_label.setText(final_html)
+
+        if scores:
+            best_name, best_score = scores[0]
+            if best_score > self.passing_threshold:
+                self._trigger_success(best_name, best_score)
+
+    def _trigger_success(self, name, score):
+        self.action_counts[name] += 1
+        
+        self.current_action_label.setText(f"✅ {name} ({score:.0f}%)")
+        self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
+        
+        self.last_action_name = f"{name}"
+        self.history_label.setText(f"上一個動作: {name} ({score:.0f}%)")
+        
         self._update_stats_display()
+        
+        self.motion_buffer.clear() 
+        self.cooldown = 15 
+        
+        self.debug_label.setText(f"| ✅ {name} HIT! |")
 
-    # [NEW] 重置計數器功能
-    def _reset_counters(self):
-        for name in self.action_counts:
-            self.action_counts[name] = 0
-        self._update_stats_display()
-        self.current_action_label.setText("計數已歸零")
-        QMessageBox.information(self, "Reset", "練習次數已歸零！")
-
-    # --- 3. SLIDING WINDOW PROCESS ---
+    # --- 4. PROCESS FRAME ---
     def _process_frame(self):
         if not self.is_running or not self.camera_cap: return
 
         ret, frame = self.camera_cap.read()
         if not ret: return
-
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            if self.cooldown_counter == 0:
-                self.current_action_label.setText("準備中...")
-                self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #888; border: 2px solid #888; padding: 10px;")
-                self.motion_buffer.clear() 
-                self.last_best_score = 0
-            
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self._update_camera_widget(frame_rgb)
-            return
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.posture_detector.model.predict(frame_rgb, verbose=False)
@@ -1208,87 +1417,13 @@ class RecognitionPage(QWidget):
 
         if current_kpts is None: return
 
-        norm_pose = self._normalize_keypoints(current_kpts)
-        self.motion_buffer.append(norm_pose) 
+        self.motion_buffer.append(current_kpts) 
         
         self.check_interval += 1
-        if self.check_interval % 3 == 0 and len(self.motion_buffer) > 20:
+        if self.check_interval % 2 == 0: 
             self._scan_buffer()
 
-    def _scan_buffer(self):
-        """ 掃描並更新儀表板 """
-        user_features = self._extract_features(self.motion_buffer)
-        
-        recorded_seq_flipped = []
-        for pose in self.motion_buffer:
-            flipped = pose.copy()
-            flipped[:, 0] = -flipped[:, 0] 
-            recorded_seq_flipped.append(flipped)
-        user_features_flipped = self._extract_features(recorded_seq_flipped)
-
-        scores = []
-        
-        for name, template_features in self.loaded_templates.items():
-            if len(template_features) < 10: continue
-            
-            try:
-                dist_norm, _ = fastdtw(user_features, template_features, dist=euclidean)
-                dist_flip, _ = fastdtw(user_features_flipped, template_features, dist=euclidean)
-                min_dist = min(dist_norm, dist_flip)
-                max_len = max(len(user_features), len(template_features))
-                avg_dist = min_dist / max_len
-                
-                similarity = np.exp(-0.15 * avg_dist) * 100
-                scores.append((name, similarity))
-            except Exception: continue
-
-        # [NEW] 儀表板顯示邏輯
-        # 1. 先按名字排序，確保顯示順序固定 (方便閱讀)
-        scores_sorted_by_name = sorted(scores, key=lambda x: x[0])
-        
-        dashboard_text = ""
-        for name, score in scores_sorted_by_name:
-            # 高亮顯示高分項目
-            color_hex = "#FFFFFF" # 預設白
-            if score > self.passing_threshold: color_hex = "#00E5FF" # 青色 (及格)
-            if score > 80: color_hex = "#00FF00" # 綠色 (優秀)
-            
-            dashboard_text += f"| <span style='color:{color_hex};'>{name}: {score:.0f}%</span> "
-        dashboard_text += "|"
-        
-        self.debug_label.setText(dashboard_text)
-
-        # 2. 再按分數排序，用於判定最佳動作
-        scores.sort(key=lambda x: x[1], reverse=True)
-
-        if scores:
-            best_name, best_score = scores[0]
-            
-            if best_score > self.passing_threshold:
-                if best_score > 85: 
-                     self._trigger_success(best_name, best_score)
-                elif best_score < self.last_best_score and self.last_best_score > self.passing_threshold:
-                    self._trigger_success(best_name, self.last_best_score)
-                
-                self.last_best_score = best_score
-            else:
-                self.last_best_score = 0
-
-    def _trigger_success(self, name, score):
-        display_score = min(100, score + self.display_bonus)
-        
-        self.action_counts[name] += 1
-        self.current_action_label.setText(f"✅ {name} ({display_score:.0f}%)")
-        self.current_action_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #4CAF50; border: 3px solid #4CAF50; border-radius: 10px; padding: 10px;")
-        self._update_stats_display()
-        
-        print(f">>> SUCCESS: {name} ({display_score:.0f}%)")
-        
-        self.cooldown_counter = 40 
-        self.last_best_score = 0
-        self.motion_buffer.clear() 
-
-    # --- HELPERS (SAME) ---
+    # --- HELPERS ---
     def _populate_cameras(self):
         cams = get_working_cameras()
         self.combo_camera.clear()
@@ -1306,8 +1441,8 @@ class RecognitionPage(QWidget):
                 self._start_recognition()
 
     def _on_difficulty_changed(self, index):
-        if index == 0: self.passing_threshold = 30
-        elif index == 1: self.passing_threshold = 50
+        if index == 0: self.passing_threshold = 45
+        elif index == 1: self.passing_threshold = 60
         elif index == 2: self.passing_threshold = 75
         print(f"Threshold: >{self.passing_threshold}%")
 
@@ -1317,6 +1452,14 @@ class RecognitionPage(QWidget):
             color = "#FFFFFF" if count == 0 else "#4CAF50"
             text += f"<div style='margin-bottom:5px;'><span style='color:{color}; font-weight:bold;'>{name}:</span> {count} 次</div>"
         self.stats_label.setText(text)
+
+    def _reset_counters(self):
+        for name in self.action_counts:
+            self.action_counts[name] = 0
+        self._update_stats_display()
+        self.current_action_label.setText("計數已歸零")
+        self.history_label.setText("上一個動作: 無")
+        QMessageBox.information(self, "Reset", "練習次數已歸零！")
 
     def _update_camera_widget(self, img):
         h, w, ch = img.shape
@@ -1354,11 +1497,20 @@ class RecognitionPage(QWidget):
 
     def _start_recognition(self):
         if not self.loaded_templates:
-            QMessageBox.warning(self, "Warning", "無動作資料！")
-            return
+            self._load_templates()
+            if not self.loaded_templates:
+                QMessageBox.warning(self, "Warning", "無動作資料！請先到記錄模式錄製動作。")
+                return
+        
         cam_idx, cam_backend = self.app_state.camera_config
-        self.camera_cap = cv2.VideoCapture(cam_idx, cam_backend)
-        if not self.camera_cap.isOpened(): return
+        try:
+            self.camera_cap = cv2.VideoCapture(cam_idx, cam_backend)
+            if not self.camera_cap.isOpened(): 
+                raise Exception("Camera failed to open")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"無法啟動攝影機: {e}")
+            return
+            
         self.is_running = True
         self.motion_buffer.clear() 
         self.detection_timer.start(30)
